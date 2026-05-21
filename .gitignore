@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Project-specific: never commit user-generated data
+inbox/
+processing/
+completed/
+failed/
+datasets/
+probe_compare/
+probe_runs/
+test_grid/
+*.log
+.original_backups/
+
+# HDRI assets — large, user-supplied
+assets/hdri/
+
+# Test outputs / scratch
+scratch/
+tmp/
+*.tmp
+
+# Markdown drafts not meant for publish (session-private)
+HANDOFF.md
+MORNING_PLAN.md
+
+# OS junk
+.DS_Store
+desktop.ini
