@@ -2,17 +2,25 @@
 title Image2Splat - AutoCrop
 setlocal
 
-REM This BAT runs autocrop.py on the daemon's inbox folder. It detects the
-REM bounding box of subject pixels (anything not near-white, near-black, or
-REM transparent), expands by 40px on all sides, and overwrites the originals
-REM in place. Originals are auto-backed up to inbox/.original_backups/ for
-REM safety — delete that folder once you're confident the crops are correct.
+REM Use this BAT's parent folder as the hot-folder root.
+REM This BAT MUST live in the hot-folder (alongside Start Splat Daemon.bat).
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+REM Translate Windows path to WSL (/mnt/c/Users/...)
+for /f "usebackq tokens=*" %%i in (`wsl wslpath -u "%ROOT%"`) do set "WSL_ROOT=%%i"
+
+REM Ensure inbox exists
+if not exist "%ROOT%\inbox" mkdir "%ROOT%\inbox"
 
 echo ============================================================
 echo   Image2Splat - AutoCrop
 echo ============================================================
 echo.
-echo   Crops images in inbox/ to a tight 40px-bordered bounding box.
+echo   Hot-folder: %ROOT%
+echo   Operating on:  %ROOT%\inbox
+echo.
+echo   Crops images to a tight 40px-bordered bounding box.
 echo   Originals are auto-backed up to inbox\.original_backups\
 echo.
 echo   This eliminates wasted negative space, increasing subject
@@ -22,7 +30,7 @@ echo   Run BEFORE the splat daemon for best results.
 echo ============================================================
 echo.
 
-wsl.exe -e bash -lic "~/projects/Image2Splat/scripts/run_autocrop.sh"
+wsl.exe -e bash -lic "~/projects/Image2Splat/scripts/run_autocrop.sh '%WSL_ROOT%/inbox'"
 
 echo.
 echo ============================================================
