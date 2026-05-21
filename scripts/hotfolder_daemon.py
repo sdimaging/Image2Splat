@@ -550,8 +550,14 @@ class Daemon:
                 t_run = time.time()
                 try:
                     mesh = bb.run(image, seed=seed)
-                    if mesh.faces.shape[0] > self.args.max_faces:
+                    raw_verts = int(mesh.vertices.shape[0])
+                    raw_faces = int(mesh.faces.shape[0])
+                    if raw_faces > self.args.max_faces:
                         mesh.simplify(target=self.args.max_faces, verbose=False)
+                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f "
+                                 f"→ DECIM → {mesh.vertices.shape[0]:,}v / {mesh.faces.shape[0]:,}f")
+                    else:
+                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
                     frames = render_multiview(
                         mesh, view_w2c, fov_deg=self.args.fov,
                         resolution=self.args.resolution, envmap=envmap,
