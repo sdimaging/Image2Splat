@@ -55,9 +55,6 @@ from src.render import render_multiview
 
 
 VALID_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-# Override via $IMAGE2SPLAT_HOTFOLDER env var or --hotfolder CLI arg. On Windows-WSL,
-# point this to a Desktop folder so the BAT can drop files into it from Windows:
-#   export IMAGE2SPLAT_HOTFOLDER='/mnt/c/Users/<you>/Desktop/image2splat'
 DEFAULT_HOTFOLDER = Path(
     os.environ.get("IMAGE2SPLAT_HOTFOLDER", str(Path.home() / "image2splat"))
 ).expanduser()
@@ -155,6 +152,82 @@ def build_probe_seed_list(seed_count: int, anchor_seed: int = DEFAULT_SEED) -> l
         if s not in seeds:
             seeds.append(s)
     return seeds
+
+
+def _build_probe_summary_md(meta: dict) -> str:
+    """Human-readable companion to probe_meta.json. One table per asset."""
+    slug = meta.get("slug", "?")
+    batch = meta.get("batch", {})
+    started = batch.get("started_at", "?")
+    finished = batch.get("finished_at", "?")
+    total_min = (batch.get("total_wall_time_s") or 0) / 60.0
+    n_run = batch.get("n_cells_run", 0)
+    n_skip = batch.get("n_cells_skipped", 0)
+    n_total = batch.get("n_cells_total", 0)
+    img = meta.get("input_image") or {}
+
+    lines: list[str] = []
+    lines.append(f"# Probe Summary — {slug}")
+    lines.append("")
+    lines.append(f"**Started:** {started}  ")
+    lines.append(f"**Finished:** {finished}  ")
+    lines.append(f"**Wall time:** {total_min:.1f} min  ")
+    lines.append(f"**Cells:** {n_run} run, {n_skip} skipped, {n_total} total")
+    lines.append("")
+    lines.append("## Input")
+    lines.append("")
+    lines.append(f"- File: `{meta.get('image', '?')}`")
+    lines.append(f"- Size: {img.get('width', '?')}×{img.get('height', '?')} ({img.get('mode', '?')})")
+    lines.append(f"- HDRI: `{meta.get('hdri', '?')}` @ exposure {meta.get('hdri_exposure', '?')}")
+    lines.append(f"- Pipeline: `{meta.get('pipeline_type', '?')}` · max_tokens={meta.get('max_num_tokens', '?')}")
+    lines.append(f"- Render: {meta.get('resolution', '?')}px @ FOV {meta.get('fov', '?')}° · view {meta.get('render_view', '?')}")
+    lines.append("")
+    lines.append("## Tier configuration")
+    lines.append("")
+    lines.append("| Tier | Name | Steps | Shape | Tex |")
+    lines.append("|---|---|---|---|---|")
+    for k, t in (meta.get("tiers") or {}).items():
+        lines.append(f"| {k} | {t.get('name','?')} | {t.get('steps','?')} | {t.get('shape','?')} | {t.get('tex','?')} |")
+    lines.append("")
+    lines.append("## Cells")
+    lines.append("")
+    lines.append("| # | Tier | Seed | Raw mesh (v / f) | Post-decim (v / f) | Decim? | Total | Mesh | Render | Save | GPU peak | PNG |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for i, c in enumerate(meta.get("cells") or [], start=1):
+        if "error" in c:
+            lines.append(f"| {i} | {c.get('tier_key','?')} ({c.get('tier_name','?')}) | {c.get('seed','?')} | — | — | — | — | — | — | — | — | FAIL: `{c['error'][:60]}` |")
+            continue
+        m = c.get("mesh", {})
+        t = c.get("timing_s", {})
+        raw = f"{m.get('raw_verts',0):,} / {m.get('raw_faces',0):,}"
+        post = f"{m.get('post_decim_verts',0):,} / {m.get('post_decim_faces',0):,}"
+        decim = "YES" if m.get("decimated") else "no"
+        lines.append(
+            f"| {i} | {c.get('tier_key','?')} ({c.get('tier_name','?')}) | {c.get('seed','?')} | "
+            f"{raw} | {post} | {decim} | "
+            f"{t.get('total','?')}s | {t.get('mesh_gen','?')}s | {t.get('render','?')}s | {t.get('polish_save','?')}s | "
+            f"{c.get('gpu_peak_gb','?')} GB | {c.get('output_size_mb','?')} MB |"
+        )
+    lines.append("")
+
+    # Batch stats — average over successful cells
+    ok = [c for c in (meta.get("cells") or []) if "error" not in c]
+    if ok:
+        avg_total = sum((c.get("timing_s") or {}).get("total", 0) for c in ok) / len(ok)
+        avg_mesh = sum((c.get("timing_s") or {}).get("mesh_gen", 0) for c in ok) / len(ok)
+        avg_render = sum((c.get("timing_s") or {}).get("render", 0) for c in ok) / len(ok)
+        peak_gpu = max(c.get("gpu_peak_gb", 0) for c in ok)
+        decim_count = sum(1 for c in ok if (c.get("mesh") or {}).get("decimated"))
+        lines.append("## Batch stats")
+        lines.append("")
+        lines.append(f"- Successful cells: {len(ok)} / {n_total}")
+        lines.append(f"- Avg total / cell: {avg_total:.1f}s")
+        lines.append(f"- Avg mesh gen: {avg_mesh:.1f}s · Avg render: {avg_render:.1f}s")
+        lines.append(f"- Peak GPU across batch: {peak_gpu:.1f} GB")
+        lines.append(f"- Cells that hit decim cap: {decim_count} / {len(ok)}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def interactive_select_force_rembg(default: bool) -> bool:
@@ -515,9 +588,129 @@ class Daemon:
         n_total = len(SAMPLER_TIERS) * len(self.probe_seeds)
         run_idx = 0
 
+        # Per-cell production data accumulated here
+        cells: list[dict] = []
+        n_skipped = 0
+        batch_start = time.time()
+        started_at = datetime.now().isoformat()
+        input_w, input_h = image.size
+        input_mode = image.mode
+
+        for tier_key, (tier_name, _, _, _) in SAMPLER_TIERS.items():
+            _apply_tier_to_backbone(bb, tier_key)
+            eff_sparse = dict(bb.sparse_structure_sampler_params)
+            eff_shape = dict(bb.shape_slat_sampler_params)
+            eff_tex = dict(bb.tex_slat_sampler_params)
+            for seed in self.probe_seeds:
+                run_idx += 1
+                out_path = probe_dir / f"{PROBE_VIEW:03d}_T{tier_key}_{tier_name.lower()}_seed{seed}.png"
+                if out_path.exists():
+                    self.log(f"  [{run_idx}/{n_total}] tier {tier_key} ({tier_name}) seed={seed}  SKIP (exists)")
+                    n_skipped += 1
+                    continue
+                self.log(f"  [{run_idx}/{n_total}] tier {tier_key} ({tier_name}) seed={seed}")
+                t_cell = time.time()
+                torch.cuda.reset_peak_memory_stats()
+                try:
+                    t_mesh = time.time()
+                    mesh = bb.run(image, seed=seed)
+                    mesh_gen_s = time.time() - t_mesh
+                    raw_verts = int(mesh.vertices.shape[0])
+                    raw_faces = int(mesh.faces.shape[0])
+
+                    decimated = False
+                    post_verts = raw_verts
+                    post_faces = raw_faces
+                    if raw_faces > self.args.max_faces:
+                        mesh.simplify(target=self.args.max_faces, verbose=False)
+                        decimated = True
+                        post_verts = int(mesh.vertices.shape[0])
+                        post_faces = int(mesh.faces.shape[0])
+                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f "
+                                 f"→ DECIM → {post_verts:,}v / {post_faces:,}f")
+                    else:
+                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
+
+                    t_render = time.time()
+                    frames = render_multiview(
+                        mesh, view_w2c, fov_deg=self.args.fov,
+                        resolution=self.args.resolution, envmap=envmap,
+                        repo_dir=bb.repo_dir, device=bb.device, verbose=False,
+                    )
+                    render_s = time.time() - t_render
+
+                    t_save = time.time()
+                    frame = frames[0]
+                    if (self.args.polish_sharpen_percent > 0
+                            or self.args.polish_grain_strength > 0):
+                        rgba = np.array(frame.convert("RGBA"))
+                        rgba = polish_rgba(
+                            rgba, image_index=PROBE_VIEW,
+                            sharpen_percent=self.args.polish_sharpen_percent,
+                            sharpen_radius=self.args.polish_sharpen_radius,
+                            sharpen_threshold=self.args.polish_sharpen_threshold,
+                            grain_strength=self.args.polish_grain_strength,
+                            grain_seed_base=seed,
+                            grain_monochrome=self.args.polish_grain_monochrome,
+                        )
+                        Image.fromarray(rgba).save(out_path)
+                    else:
+                        frame.save(out_path)
+                    polish_save_s = time.time() - t_save
+
+                    total_s = time.time() - t_cell
+                    gpu_peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                    out_size_mb = out_path.stat().st_size / (1024 ** 2)
+
+                    cells.append({
+                        "tier_key": tier_key,
+                        "tier_name": tier_name,
+                        "seed": seed,
+                        "out_file": out_path.name,
+                        "mesh": {
+                            "raw_verts": raw_verts,
+                            "raw_faces": raw_faces,
+                            "decimated": decimated,
+                            "post_decim_verts": post_verts,
+                            "post_decim_faces": post_faces,
+                        },
+                        "timing_s": {
+                            "total": round(total_s, 2),
+                            "mesh_gen": round(mesh_gen_s, 2),
+                            "render": round(render_s, 2),
+                            "polish_save": round(polish_save_s, 2),
+                        },
+                        "output_size_mb": round(out_size_mb, 2),
+                        "gpu_peak_gb": round(gpu_peak_gb, 2),
+                        "effective_sampler_params": {
+                            "sparse": eff_sparse,
+                            "shape": eff_shape,
+                            "tex": eff_tex,
+                        },
+                    })
+
+                    self.log(f"    ✓ {out_path.name} ({total_s:.1f}s, gpu peak {gpu_peak_gb:.1f}GB)")
+                    del frames, mesh
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    self.log(f"    FAIL: {e}")
+                    cells.append({
+                        "tier_key": tier_key,
+                        "tier_name": tier_name,
+                        "seed": seed,
+                        "error": str(e),
+                    })
+
+        total_wall = time.time() - batch_start
         meta = {
             "image": image_path.name,
             "slug": slug,
+            "input_image": {
+                "width": input_w,
+                "height": input_h,
+                "mode": input_mode,
+            },
             "render_view": PROBE_VIEW,
             "seeds": self.probe_seeds,
             "tiers": {k: {"name": v[0], "steps": v[1], "shape": v[2], "tex": v[3]}
@@ -535,63 +728,27 @@ class Daemon:
                 "grain_strength": self.args.polish_grain_strength,
                 "grain_monochrome": self.args.polish_grain_monochrome,
             },
-            "generated_at": datetime.now().isoformat(),
+            "batch": {
+                "started_at": started_at,
+                "finished_at": datetime.now().isoformat(),
+                "total_wall_time_s": round(total_wall, 2),
+                "n_cells_total": n_total,
+                "n_cells_run": len(cells),
+                "n_cells_skipped": n_skipped,
+            },
+            "cells": cells,
         }
-
-        for tier_key, (tier_name, _, _, _) in SAMPLER_TIERS.items():
-            _apply_tier_to_backbone(bb, tier_key)
-            for seed in self.probe_seeds:
-                run_idx += 1
-                out_path = probe_dir / f"{PROBE_VIEW:03d}_T{tier_key}_{tier_name.lower()}_seed{seed}.png"
-                if out_path.exists():
-                    self.log(f"  [{run_idx}/{n_total}] tier {tier_key} ({tier_name}) seed={seed}  SKIP (exists)")
-                    continue
-                self.log(f"  [{run_idx}/{n_total}] tier {tier_key} ({tier_name}) seed={seed}")
-                t_run = time.time()
-                try:
-                    mesh = bb.run(image, seed=seed)
-                    raw_verts = int(mesh.vertices.shape[0])
-                    raw_faces = int(mesh.faces.shape[0])
-                    if raw_faces > self.args.max_faces:
-                        mesh.simplify(target=self.args.max_faces, verbose=False)
-                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f "
-                                 f"→ DECIM → {mesh.vertices.shape[0]:,}v / {mesh.faces.shape[0]:,}f")
-                    else:
-                        self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
-                    frames = render_multiview(
-                        mesh, view_w2c, fov_deg=self.args.fov,
-                        resolution=self.args.resolution, envmap=envmap,
-                        repo_dir=bb.repo_dir, device=bb.device, verbose=False,
-                    )
-                    frame = frames[0]
-                    if (self.args.polish_sharpen_percent > 0
-                            or self.args.polish_grain_strength > 0):
-                        rgba = np.array(frame.convert("RGBA"))
-                        rgba = polish_rgba(
-                            rgba, image_index=PROBE_VIEW,
-                            sharpen_percent=self.args.polish_sharpen_percent,
-                            sharpen_radius=self.args.polish_sharpen_radius,
-                            sharpen_threshold=self.args.polish_sharpen_threshold,
-                            grain_strength=self.args.polish_grain_strength,
-                            grain_seed_base=seed,
-                            grain_monochrome=self.args.polish_grain_monochrome,
-                        )
-                        Image.fromarray(rgba).save(out_path)
-                    else:
-                        frame.save(out_path)
-                    self.log(f"    ✓ {out_path.name} ({time.time()-t_run:.1f}s)")
-                    del frames, mesh
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                except Exception as e:
-                    self.log(f"    FAIL: {e}")
 
         try:
             (probe_dir / "probe_meta.json").write_text(json.dumps(meta, indent=2))
         except OSError:
             pass
+        try:
+            (probe_dir / "probe_summary.md").write_text(_build_probe_summary_md(meta))
+        except OSError:
+            pass
 
-        self.log(f"  ✓ probe complete → {probe_dir} ({n_total} cells)")
+        self.log(f"  ✓ probe complete → {probe_dir} ({len(cells)} cells in {total_wall/60:.1f} min)")
         return slug_root
 
     def shutdown(self, *_):
