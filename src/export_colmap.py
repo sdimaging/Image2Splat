@@ -27,29 +27,56 @@ import numpy as np
 
 from .cameras import w2c_to_colmap_qvec_tvec
 
-CAMERA_ID = 1  # we use a single shared camera for the whole dataset
+CAMERA_ID = 1  # default ID for single-camera datasets
 
 
-def _format_cameras_txt(intrinsics: dict) -> str:
-    """Header + one line for the single shared PINHOLE camera."""
+def _intrinsics_list(intrinsics: dict | list[dict], n_images: int) -> list[dict]:
+    """Normalize intrinsics input to a list of length n_images.
+
+    Accepts a single dict (replicated → one shared camera) or a list of dicts
+    (per-image cameras, one entry per image). Validates length when a list is
+    provided.
+    """
+    if isinstance(intrinsics, dict):
+        return [intrinsics] * n_images
+    intr_list = list(intrinsics)
+    if len(intr_list) != n_images:
+        raise ValueError(
+            f"intrinsics list length {len(intr_list)} != n_images {n_images}"
+        )
+    return intr_list
+
+
+def _format_cameras_txt(intrinsics: dict | list[dict], n_images: int) -> str:
+    """Header + N PINHOLE lines. One camera if intrinsics is a dict, else N.
+
+    For per-image cameras, CAMERA_ID is 1-indexed and matches the image's
+    1-indexed IMAGE_ID — each image gets its own camera entry.
+    """
+    if isinstance(intrinsics, dict):
+        intr_list = [intrinsics]
+    else:
+        intr_list = _intrinsics_list(intrinsics, n_images)
+    n_cams = len(intr_list)
     header = (
         "# Camera list with one line of data per camera:\n"
         "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
-        "# Number of cameras: 1\n"
+        f"# Number of cameras: {n_cams}\n"
     )
-    line = (
-        f"{CAMERA_ID} PINHOLE "
-        f"{intrinsics['width']} {intrinsics['height']} "
-        f"{intrinsics['fx']:.6f} {intrinsics['fy']:.6f} "
-        f"{intrinsics['cx']:.6f} {intrinsics['cy']:.6f}\n"
+    body = "".join(
+        f"{i+1} PINHOLE "
+        f"{intr['width']} {intr['height']} "
+        f"{intr['fx']:.6f} {intr['fy']:.6f} "
+        f"{intr['cx']:.6f} {intr['cy']:.6f}\n"
+        for i, intr in enumerate(intr_list)
     )
-    return header + line
+    return header + body
 
 
 def _format_images_txt(
     w2c_matrices: np.ndarray,
     image_names: list[str],
-    intrinsics: dict,
+    intrinsics: dict | list[dict],
     n_points: int = 0,
 ) -> str:
     """Two lines per image: pose line + POINTS2D line.
@@ -68,8 +95,8 @@ def _format_images_txt(
             f"matrices ({len(w2c_matrices)}) and names ({len(image_names)}) length mismatch"
         )
     n_imgs = len(image_names)
-    cx = intrinsics["cx"]
-    cy = intrinsics["cy"]
+    multi_cam = not isinstance(intrinsics, dict)
+    intr_list = _intrinsics_list(intrinsics, n_imgs) if multi_cam else None
 
     # Per-image POINTS2D: list of (point3d_id) where (point3d_id - 1) % n_imgs == image_idx
     # point3d_id is 1-indexed in COLMAP.
@@ -87,12 +114,21 @@ def _format_images_txt(
     )
     lines = []
     for i, (w2c, name) in enumerate(zip(w2c_matrices, image_names), start=1):
+        # For multi-cam datasets, CAMERA_ID matches IMAGE_ID (both 1-indexed).
+        # For single-cam datasets, every image references CAMERA_ID=1.
+        cam_id = i if multi_cam else CAMERA_ID
+        if multi_cam:
+            cx = intr_list[i - 1]["cx"]
+            cy = intr_list[i - 1]["cy"]
+        else:
+            cx = intrinsics["cx"]
+            cy = intrinsics["cy"]
         qvec, tvec = w2c_to_colmap_qvec_tvec(w2c)
         pose_line = (
             f"{i} "
             f"{qvec[0]:.9f} {qvec[1]:.9f} {qvec[2]:.9f} {qvec[3]:.9f} "
             f"{tvec[0]:.9f} {tvec[1]:.9f} {tvec[2]:.9f} "
-            f"{CAMERA_ID} {name}\n"
+            f"{cam_id} {name}\n"
         )
         lines.append(pose_line)
         # POINTS2D line: (x, y, point3d_id) triples space-separated; empty if no points.
@@ -165,7 +201,7 @@ def write_colmap_dataset(
     output_dir: str | Path,
     w2c_matrices: np.ndarray,
     image_names: list[str] | Iterable[str],
-    intrinsics: dict,
+    intrinsics: dict | list[dict],
     points: np.ndarray | None = None,
     point_colors: np.ndarray | None = None,
 ) -> Path:
@@ -176,8 +212,10 @@ def write_colmap_dataset(
         w2c_matrices: (N, 4, 4) OpenCV world-to-camera matrices (as produced by cameras.look_at).
         image_names: filenames of the N rendered images (without directory prefix —
                      these get joined with `images/` by the splat trainer).
-        intrinsics: dict with fx, fy, cx, cy, width, height (as produced by
-                    cameras.intrinsics_from_fov).
+        intrinsics: dict (one shared PINHOLE camera for the whole dataset) OR a
+                    list[dict] of length N (one camera per image — for per-view
+                    adaptive FOV). Each dict has fx, fy, cx, cy, width, height
+                    (as produced by cameras.intrinsics_from_fov).
         points: optional (M, 3) array of init point positions in world coords.
                 PostShot rejects empty points3D ("Import contains no 3D points data"),
                 so for PostShot/COLMAP-importing trainers, pass mesh vertices here.
@@ -198,7 +236,7 @@ def write_colmap_dataset(
 
     n_points = 0 if points is None else len(points)
     n_images = len(image_names)
-    (sparse_dir / "cameras.txt").write_text(_format_cameras_txt(intrinsics))
+    (sparse_dir / "cameras.txt").write_text(_format_cameras_txt(intrinsics, n_images))
     (sparse_dir / "images.txt").write_text(
         _format_images_txt(w2c_matrices, image_names, intrinsics, n_points=n_points)
     )

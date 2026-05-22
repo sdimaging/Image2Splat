@@ -108,6 +108,83 @@ def intrinsics_from_fov(fov_vertical_deg: float, image_size: int) -> dict:
     }
 
 
+def compute_adaptive_fov(
+    vertices: np.ndarray,
+    w2c_matrices: np.ndarray,
+    *,
+    margin: float = 0.10,
+    fov_min: float = 12.0,
+    fov_max: float = 55.0,
+    per_view: bool = False,
+) -> np.ndarray | float:
+    """Compute tight vertical FOV(s) by projecting mesh vertices through camera poses.
+
+    For each view, projects all front-facing vertices into camera space and finds
+    the max angular extent: max(atan|x|/z, atan|y|/z). 2× this gives the FOV that
+    JUST contains the silhouette; multiply by (1+margin) for padding, then clamp
+    to [fov_min, fov_max] to avoid pathological zoom on degenerate geometry.
+
+    Args:
+        vertices: (V, 3) world-space mesh vertices.
+        w2c_matrices: (N, 4, 4) OpenCV world-to-camera matrices — must be the
+            EXACT matrices that will be passed to render_multiview (i.e. include
+            any mesh-rotation baking).
+        margin: fractional padding on the tight FOV (0.10 = 10% padding).
+        fov_min: lower clamp in degrees. Below this, the projection is so tight
+            that nvdiffrast precision starts to matter; 12° is a safe floor.
+        fov_max: upper clamp. Above this we'd be looking at empty space anyway —
+            55° is wider than the daemon's fixed 40° default so it never enlarges.
+        per_view: if True, returns (N,) array of per-view FOVs. If False (default),
+            returns a single scalar — the max across all views (so a uniform FOV
+            still fits every view's silhouette).
+
+    Returns:
+        Scalar float (per_view=False) or (N,) np.ndarray (per_view=True).
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+    w2c_matrices = np.asarray(w2c_matrices, dtype=np.float64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"vertices must be (V, 3), got {vertices.shape}")
+    if w2c_matrices.ndim != 3 or w2c_matrices.shape[1:] != (4, 4):
+        raise ValueError(f"w2c_matrices must be (N, 4, 4), got {w2c_matrices.shape}")
+    V = vertices.shape[0]
+    if V == 0:
+        # Degenerate mesh — fall back to fov_max so we definitely don't clip.
+        if per_view:
+            return np.full(len(w2c_matrices), fov_max)
+        return float(fov_max)
+
+    # Homogeneous projection: (N, 4, 4) @ (V, 4).T → (N, 4, V)
+    verts_h = np.concatenate([vertices, np.ones((V, 1))], axis=1)  # (V, 4)
+    # einsum is clearer than reshape gymnastics: (N, V, 4)
+    verts_cam = np.einsum("nij,vj->nvi", w2c_matrices, verts_h)
+    x = verts_cam[..., 0]
+    y = verts_cam[..., 1]
+    z = verts_cam[..., 2]
+
+    # Only consider verts in front of the camera (z > 0 in OpenCV convention)
+    in_front = z > 1e-3
+    z_safe = np.where(in_front, z, 1.0)  # avoid div-by-zero; we'll mask after
+    theta_h = np.arctan(np.abs(x) / z_safe)
+    theta_v = np.arctan(np.abs(y) / z_safe)
+    theta = np.maximum(theta_h, theta_v)
+    theta = np.where(in_front, theta, 0.0)
+
+    # Per-view max angular extent (V axis)
+    max_theta_per_view = theta.max(axis=1)  # (N,)
+
+    if per_view:
+        fov_rad = 2.0 * max_theta_per_view * (1.0 + margin)
+        fov_deg = np.degrees(fov_rad)
+        fov_deg = np.clip(fov_deg, fov_min, fov_max)
+        return fov_deg
+
+    # Uniform: take the worst view, then pad
+    worst = float(max_theta_per_view.max())
+    fov_deg = float(np.degrees(2.0 * worst * (1.0 + margin)))
+    return float(np.clip(fov_deg, fov_min, fov_max))
+
+
 def opencv_w2c_to_opengl_c2w(w2c: np.ndarray) -> np.ndarray:
     """Convert an OpenCV world-to-camera matrix to OpenGL camera-to-world.
 

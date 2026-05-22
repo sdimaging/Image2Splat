@@ -46,7 +46,11 @@ import torch
 from PIL import Image
 
 from src.backbone import Backbone
-from src.cameras import generate_camera_trajectory, intrinsics_from_fov
+from src.cameras import (
+    compute_adaptive_fov,
+    generate_camera_trajectory,
+    intrinsics_from_fov,
+)
 from src.export_colmap import write_colmap_dataset
 from src.export_nerfstudio import write_nerfstudio_dataset
 from src.mesh_export import export_mesh
@@ -191,20 +195,22 @@ def _build_probe_summary_md(meta: dict) -> str:
     lines.append("")
     lines.append("## Cells")
     lines.append("")
-    lines.append("| # | Tier | Seed | Raw mesh (v / f) | Post-decim (v / f) | Decim? | Total | Mesh | Render | Save | GPU peak | PNG |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| # | Tier | Seed | Raw mesh (v / f) | Post-decim (v / f) | Decim? | FOV | Total | Mesh | Render | Save | GPU peak | PNG |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for i, c in enumerate(meta.get("cells") or [], start=1):
         if "error" in c:
-            lines.append(f"| {i} | {c.get('tier_key','?')} ({c.get('tier_name','?')}) | {c.get('seed','?')} | — | — | — | — | — | — | — | — | FAIL: `{c['error'][:60]}` |")
+            lines.append(f"| {i} | {c.get('tier_key','?')} ({c.get('tier_name','?')}) | {c.get('seed','?')} | — | — | — | — | — | — | — | — | — | FAIL: `{c['error'][:60]}` |")
             continue
         m = c.get("mesh", {})
         t = c.get("timing_s", {})
         raw = f"{m.get('raw_verts',0):,} / {m.get('raw_faces',0):,}"
         post = f"{m.get('post_decim_verts',0):,} / {m.get('post_decim_faces',0):,}"
         decim = "YES" if m.get("decimated") else "no"
+        fov_val = c.get("effective_fov_deg", "?")
         lines.append(
             f"| {i} | {c.get('tier_key','?')} ({c.get('tier_name','?')}) | {c.get('seed','?')} | "
             f"{raw} | {post} | {decim} | "
+            f"{fov_val}° | "
             f"{t.get('total','?')}s | {t.get('mesh_gen','?')}s | {t.get('render','?')}s | {t.get('polish_save','?')}s | "
             f"{c.get('gpu_peak_gb','?')} GB | {c.get('output_size_mb','?')} MB |"
         )
@@ -398,6 +404,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-seed-count", type=int, default=1,
                    help="In probe mode, number of seeds to test (1=just DEFAULT_SEED, "
                         "N=anchor + N-1 randoms). Ignored when --tier != 6.")
+    p.add_argument("--adaptive-fov", choices=["off", "uniform", "per-view"], default="off",
+                   help="Auto-tighten FOV to fit mesh silhouette and reduce wasted "
+                        "negative space in rendered views. "
+                        "off=use fixed --fov (default, current behavior). "
+                        "uniform=one tight FOV across all views (worst-case-fits-all, "
+                        "1-camera COLMAP, identical to legacy output format). "
+                        "per-view=tightest FOV per camera (max detail capture, "
+                        "N-camera COLMAP — multi-camera per-image intrinsics).")
+    p.add_argument("--adaptive-fov-margin", type=float, default=0.10,
+                   help="Fractional padding on adaptive FOV (0.10 = 10%% extra margin "
+                        "around the tight silhouette fit). Higher = safer, lower = "
+                        "tighter zoom = more subject pixels per view.")
+    p.add_argument("--adaptive-fov-min", type=float, default=12.0,
+                   help="Lower clamp for adaptive FOV (deg). Floor prevents pathological "
+                        "zoom on degenerate / empty meshes.")
+    p.add_argument("--adaptive-fov-max", type=float, default=55.0,
+                   help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
+                        "the auto-FOV can go; if your default --fov is higher than "
+                        "this, --adaptive-fov off uses --fov as-is.")
     return p.parse_args()
 
 
@@ -473,6 +498,54 @@ class Daemon:
         img = read_exr_rgb(self.args.hdri) * float(self.args.hdri_exposure)
         return EnvMap(torch.tensor(img, dtype=torch.float32, device=bb.device))
 
+    def _resolve_adaptive_fov(
+        self, mesh_verts_np: np.ndarray, w2c: np.ndarray, intr: dict,
+    ) -> tuple[float, np.ndarray | None, dict | list[dict]]:
+        """Compute effective FOV(s) + intrinsics for the current adaptive-fov mode.
+
+        Returns:
+            (scalar_fov, per_view_fov_array_or_None, intrinsics_for_export)
+            where intrinsics_for_export is a dict (uniform / off) or a list[dict]
+            (per-view). The caller passes intrinsics_for_export straight to the
+            COLMAP/Nerfstudio writers; per_view_fov_array_or_None drives
+            render_multiview slicing.
+        """
+        mode = self.args.adaptive_fov
+        if mode == "off":
+            return float(self.args.fov), None, intr
+
+        if mode == "uniform":
+            fov = compute_adaptive_fov(
+                mesh_verts_np, w2c,
+                margin=self.args.adaptive_fov_margin,
+                fov_min=self.args.adaptive_fov_min,
+                fov_max=self.args.adaptive_fov_max,
+                per_view=False,
+            )
+            new_intr = intrinsics_from_fov(fov, self.args.resolution)
+            self.log(f"  adaptive FOV (uniform): {self.args.fov:.1f}° → {fov:.2f}° "
+                     f"(margin {self.args.adaptive_fov_margin:.2f})")
+            return float(fov), None, new_intr
+
+        # per-view
+        fov_arr = compute_adaptive_fov(
+            mesh_verts_np, w2c,
+            margin=self.args.adaptive_fov_margin,
+            fov_min=self.args.adaptive_fov_min,
+            fov_max=self.args.adaptive_fov_max,
+            per_view=True,
+        )
+        intr_list = [intrinsics_from_fov(float(f), self.args.resolution)
+                     for f in fov_arr]
+        self.log(f"  adaptive FOV (per-view): "
+                 f"min={float(fov_arr.min()):.2f}°  "
+                 f"max={float(fov_arr.max()):.2f}°  "
+                 f"mean={float(fov_arr.mean()):.2f}°  "
+                 f"(N={len(fov_arr)}, margin {self.args.adaptive_fov_margin:.2f})")
+        # The scalar return value is the mean only as a representative log value;
+        # the rendering path slices fov_arr per chunk, not this scalar.
+        return float(fov_arr.mean()), fov_arr, intr_list
+
     def process_one(self, bb: Backbone, envmap, w2c, intr,
                     image_path: Path) -> Path:
         slug = slug_for(image_path)
@@ -523,12 +596,21 @@ class Daemon:
             images_dir.mkdir(parents=True, exist_ok=True)
             names: list[str] = []
             n_views = self.args.num_views
+
+            # --- Adaptive FOV computation (mesh-aware tightening) ---
+            mesh_verts_np = mesh.vertices.detach().cpu().numpy()
+            effective_fov, fov_array, render_intr = self._resolve_adaptive_fov(
+                mesh_verts_np, w2c, intr,
+            )
+
             for ck_start in range(0, n_views, self.args.chunk_size):
                 ck_end = min(ck_start + self.args.chunk_size, n_views)
                 self.log(f"  chunk {ck_start:>3}-{ck_end-1:<3} "
                          f"({ck_end - ck_start} views)")
+                ck_fov = (fov_array[ck_start:ck_end] if fov_array is not None
+                          else effective_fov)
                 frames = render_multiview(
-                    mesh, w2c[ck_start:ck_end], fov_deg=self.args.fov,
+                    mesh, w2c[ck_start:ck_end], fov_deg=ck_fov,
                     resolution=self.args.resolution, envmap=envmap,
                     repo_dir=bb.repo_dir, device=bb.device, verbose=False,
                 )
@@ -555,12 +637,11 @@ class Daemon:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            mesh_verts = mesh.vertices.detach().cpu().numpy()
-            n_init = min(self.args.num_init_points, len(mesh_verts))
+            n_init = min(self.args.num_init_points, len(mesh_verts_np))
             rng = np.random.default_rng(self.args.seed)
-            init_pts = mesh_verts[rng.choice(len(mesh_verts), size=n_init, replace=False)]
-            write_colmap_dataset(out_dir, w2c, names, intr, points=init_pts)
-            write_nerfstudio_dataset(out_dir, w2c, names, intr)
+            init_pts = mesh_verts_np[rng.choice(len(mesh_verts_np), size=n_init, replace=False)]
+            write_colmap_dataset(out_dir, w2c, names, render_intr, points=init_pts)
+            write_nerfstudio_dataset(out_dir, w2c, names, render_intr)
             self.log(f"  ✓ {len(names)} images + COLMAP + Nerfstudio → {out_dir}")
 
         return slug_root
@@ -631,9 +712,23 @@ class Daemon:
                     else:
                         self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
 
+                    # Adaptive FOV for the probe view (per-cell — mesh changes per tier/seed).
+                    # Probe is 1 view, so per-view and uniform collapse to the same scalar.
+                    if self.args.adaptive_fov == "off":
+                        cell_fov = float(self.args.fov)
+                    else:
+                        cell_fov = float(compute_adaptive_fov(
+                            mesh.vertices.detach().cpu().numpy(), view_w2c,
+                            margin=self.args.adaptive_fov_margin,
+                            fov_min=self.args.adaptive_fov_min,
+                            fov_max=self.args.adaptive_fov_max,
+                            per_view=False,
+                        ))
+                        self.log(f"    adaptive FOV: {self.args.fov:.1f}° → {cell_fov:.2f}°")
+
                     t_render = time.time()
                     frames = render_multiview(
-                        mesh, view_w2c, fov_deg=self.args.fov,
+                        mesh, view_w2c, fov_deg=cell_fov,
                         resolution=self.args.resolution, envmap=envmap,
                         repo_dir=bb.repo_dir, device=bb.device, verbose=False,
                     )
@@ -682,6 +777,7 @@ class Daemon:
                         },
                         "output_size_mb": round(out_size_mb, 2),
                         "gpu_peak_gb": round(gpu_peak_gb, 2),
+                        "effective_fov_deg": round(cell_fov, 2),
                         "effective_sampler_params": {
                             "sparse": eff_sparse,
                             "shape": eff_shape,
@@ -721,6 +817,12 @@ class Daemon:
             "max_num_tokens": self.args.max_num_tokens,
             "resolution": self.args.resolution,
             "fov": self.args.fov,
+            "adaptive_fov": {
+                "mode": self.args.adaptive_fov,
+                "margin": self.args.adaptive_fov_margin,
+                "min_deg": self.args.adaptive_fov_min,
+                "max_deg": self.args.adaptive_fov_max,
+            },
             "polish": {
                 "sharpen_percent": self.args.polish_sharpen_percent,
                 "sharpen_radius": self.args.polish_sharpen_radius,
@@ -810,6 +912,12 @@ class Daemon:
             self.log(f"  sampler   : tier {self.args.tier} ({t_name})  "
                      f"steps={t_steps}  shape={t_sg}  tex={t_tg}")
         self.log(f"  rembg     : {'force BiRefNet' if self.args.force_rembg else 'auto (use input alpha if present)'}")
+        if self.args.adaptive_fov != "off":
+            self.log(f"  adapt-FOV : {self.args.adaptive_fov}  "
+                     f"(margin {self.args.adaptive_fov_margin:.2f}, "
+                     f"clamp {self.args.adaptive_fov_min:.0f}-{self.args.adaptive_fov_max:.0f}°)")
+        else:
+            self.log(f"  adapt-FOV : off (fixed {self.args.fov}°)")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)

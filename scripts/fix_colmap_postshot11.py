@@ -48,8 +48,13 @@ def find_sparse_dirs(root: Path) -> list[Path]:
     return sorted(set(found))
 
 
-def parse_cameras_txt(path: Path) -> dict:
-    """Return intrinsics dict for the FIRST (and only) camera in cameras.txt."""
+def parse_cameras_txt(path: Path) -> dict[int, dict]:
+    """Return {camera_id: intrinsics_dict} for every PINHOLE camera in cameras.txt.
+
+    Supports both single-camera (legacy) and multi-camera (adaptive-fov per-view)
+    datasets. Caller dereferences by camera_id from images.txt.
+    """
+    cameras: dict[int, dict] = {}
     for line in path.read_text().splitlines():
         if not line or line.startswith("#"):
             continue
@@ -57,8 +62,9 @@ def parse_cameras_txt(path: Path) -> dict:
         # CAMERA_ID MODEL WIDTH HEIGHT fx fy cx cy
         if parts[1] != "PINHOLE":
             raise ValueError(f"expected PINHOLE camera, got {parts[1]} in {path}")
-        return {
-            "camera_id": int(parts[0]),
+        cam_id = int(parts[0])
+        cameras[cam_id] = {
+            "camera_id": cam_id,
             "width": int(parts[2]),
             "height": int(parts[3]),
             "fx": float(parts[4]),
@@ -66,7 +72,9 @@ def parse_cameras_txt(path: Path) -> dict:
             "cx": float(parts[6]),
             "cy": float(parts[7]),
         }
-    raise ValueError(f"no camera entry in {path}")
+    if not cameras:
+        raise ValueError(f"no camera entries in {path}")
+    return cameras
 
 
 def parse_images_txt(path: Path) -> list[tuple[int, list[str], str]]:
@@ -119,14 +127,12 @@ def parse_points3d_txt(path: Path) -> list[list[str]]:
 
 def rewrite_sparse_dir(sparse_dir: Path) -> tuple[int, int]:
     """Patch images.txt + points3D.txt in place. Returns (n_images, n_points)."""
-    cam = parse_cameras_txt(sparse_dir / "cameras.txt")
+    cams = parse_cameras_txt(sparse_dir / "cameras.txt")
     images = parse_images_txt(sparse_dir / "images.txt")
     points = parse_points3d_txt(sparse_dir / "points3D.txt")
 
     n_images = len(images)
     n_points = len(points)
-    cx = cam["cx"]
-    cy = cam["cy"]
 
     # Modulo distribution: point id (1-indexed) i  →  image ((i-1) % n_imgs)+1
     points_per_image: list[list[int]] = [[] for _ in range(n_images)]
@@ -145,6 +151,18 @@ def rewrite_sparse_dir(sparse_dir: Path) -> tuple[int, int]:
     # Sort images by image_id ascending so output is canonical
     images_sorted = sorted(images, key=lambda x: x[0])
     for image_id, tokens, _raw in images_sorted:
+        # tokens[8] is CAMERA_ID per COLMAP format. Look up that camera's cx/cy
+        # so per-image (multi-cam) datasets place POINTS2D entries at THIS image's
+        # principal point, not some other camera's. For single-cam datasets every
+        # image references the same cam_id and this reduces to the legacy path.
+        cam_id = int(tokens[8])
+        cam = cams.get(cam_id)
+        if cam is None:
+            raise ValueError(
+                f"image {image_id} references CAMERA_ID {cam_id} not present in cameras.txt"
+            )
+        cx = cam["cx"]
+        cy = cam["cy"]
         img_lines.append(_raw.rstrip() + "\n")
         observed = points_per_image[image_id - 1]
         if observed:
