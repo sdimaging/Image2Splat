@@ -27,11 +27,13 @@ import gc
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import sys
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -145,6 +147,63 @@ def interactive_select_probe_seed_count(default: int = 1, max_seeds: int = 8) ->
         except ValueError:
             pass
         print(f"  invalid, pick 1-{max_seeds}")
+
+
+TIER_SEED_RE = re.compile(r"^T(\d+)_(\d+)$")
+
+
+def parse_tier_folder(folder: Path) -> tuple[str, int] | None:
+    """Parse `T<tier_key>_<seed>` from a folder name. Returns (tier_key, seed) or None.
+
+    tier_key must be in SAMPLER_TIERS (1-5). Probe tier (6) is intentionally
+    NOT supported in batch mode — probes are a per-asset diagnostic, not a
+    bulk production target.
+    """
+    m = TIER_SEED_RE.match(folder.name)
+    if not m:
+        return None
+    tier_key, seed_str = m.group(1), m.group(2)
+    if tier_key not in SAMPLER_TIERS:
+        return None
+    try:
+        seed = int(seed_str)
+    except ValueError:
+        return None
+    return tier_key, seed
+
+
+def interactive_select_batch_mode(default_parent: Path) -> Path | None:
+    """Ask whether to enter batch mode. Returns parent path or None for normal mode.
+
+    Default parent is `<hotfolder>/processing_aurasr` if it exists, else just
+    the hotfolder itself. User can type a different path at the prompt.
+    """
+    while True:
+        s = input("Batch mode? Walk T<N>_<seed>/ subfolders and apply tier+seed per "
+                  "folder [y/N]: ").strip().lower()
+        if s in ("", "n", "no"):
+            return None
+        if s in ("y", "yes"):
+            break
+        print("  invalid, try again")
+    suggestion = default_parent / "processing_aurasr"
+    if not suggestion.is_dir():
+        suggestion = default_parent
+    while True:
+        s = input(f"Batch parent folder [{suggestion}]: ").strip()
+        candidate = Path(s).expanduser() if s else suggestion
+        if not candidate.is_dir():
+            print(f"  not a directory: {candidate} — try again or Ctrl-C to bail")
+            continue
+        # Validate at least one T<N>_<seed>/ subfolder is present
+        valid = any(parse_tier_folder(p) is not None
+                    for p in candidate.iterdir() if p.is_dir())
+        if not valid:
+            print(f"  no T<N>_<seed>/ subfolders detected under {candidate}")
+            again = input("  use it anyway? [y/N]: ").strip().lower()
+            if again not in ("y", "yes"):
+                continue
+        return candidate
 
 
 def build_probe_seed_list(seed_count: int, anchor_seed: int = DEFAULT_SEED) -> list[int]:
@@ -423,6 +482,27 @@ def parse_args() -> argparse.Namespace:
                    help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
                         "the auto-FOV can go; if your default --fov is higher than "
                         "this, --adaptive-fov off uses --fov as-is.")
+    # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
+    p.add_argument("--batch-tiered", type=Path, default=None,
+                   help="BATCH MODE: parent directory containing T<N>_<seed>/ "
+                        "subfolders (matches the daemon's tier dict). Daemon walks "
+                        "each subfolder, applies the matching tier+seed, runs process_one "
+                        "on every image inside. Bypasses single-tier hot-folder loop. "
+                        "Outputs land in datasets/<slug>/T<N>_seed<seed>_<...>/ so "
+                        "re-running the same asset at different (tier, seed) doesn't "
+                        "collide.")
+    p.add_argument("--batch-order", choices=["largest-first", "alphabetical", "random"],
+                   default="largest-first",
+                   help="Order to process batch subfolders. largest-first puts the "
+                        "long-pole jobs first so overnight runs maximize useful work "
+                        "even if interrupted late.")
+    p.add_argument("--batch-failure-policy",
+                   choices=["skip", "abort-folder", "abort-all"],
+                   default="skip",
+                   help="On per-image failure in batch mode: skip=continue to next image "
+                        "(default, robust for overnight runs); abort-folder=skip remaining "
+                        "images in the current tier folder, move to next folder; "
+                        "abort-all=stop the entire batch immediately.")
     return p.parse_args()
 
 
@@ -445,6 +525,10 @@ class Daemon:
         self.datasets = self.hotfolder / "datasets"
         self.daemon_log = self.hotfolder / "daemon.log"
         self.stopping = False
+        # Batch mode sets this per-folder so process_one prefixes the dataset
+        # subdir name with T<tier>_seed<seed>_ — prevents collisions when the
+        # same asset runs at multiple (tier, seed) combos.
+        self._batch_dataset_prefix: str = ""
 
     def setup_dirs(self) -> None:
         for d in (self.inbox, self.processing, self.completed,
@@ -552,6 +636,12 @@ class Daemon:
         slug_root = self.datasets / slug
         mode = self.args.mode
 
+        # Dataset subdir name (per-config); batch mode prefixes with T<N>_seed<S>_ to
+        # keep multi-(tier, seed) runs of the same asset side-by-side without colliding.
+        hdri_stem = self.args.hdri.stem
+        ds_subdir = (f"{self._batch_dataset_prefix}"
+                     f"{hdri_stem}_{self.args.num_views}v_{self.args.resolution}px")
+
         # Skip-existing logic — different markers per mode
         if mode == "mesh":
             mesh_marker = slug_root / "mesh.glb"
@@ -559,9 +649,7 @@ class Daemon:
                 self.log(f"  SKIP {slug}: mesh already exists at {mesh_marker}")
                 return slug_root
         else:
-            hdri_stem = self.args.hdri.stem
-            splat_dir = (slug_root /
-                         f"{hdri_stem}_{self.args.num_views}v_{self.args.resolution}px")
+            splat_dir = slug_root / ds_subdir
             if (splat_dir / "transforms.json").exists():
                 self.log(f"  SKIP {slug}: dataset already exists at {splat_dir}")
                 return slug_root
@@ -590,8 +678,7 @@ class Daemon:
 
         # --- Splat dataset (mode in {splat, both}) ---
         if mode in ("splat", "both"):
-            out_dir = (slug_root /
-                       f"{self.args.hdri.stem}_{self.args.num_views}v_{self.args.resolution}px")
+            out_dir = slug_root / ds_subdir
             images_dir = out_dir / "images"
             images_dir.mkdir(parents=True, exist_ok=True)
             names: list[str] = []
@@ -858,6 +945,136 @@ class Daemon:
             self.stopping = True
             self.log("Shutdown requested — finishing current item then exiting.")
 
+    def run_batch(self, batch_parent: Path, bb, envmap, w2c, intr) -> int:
+        """Walk T<N>_<seed>/ subfolders under batch_parent and process each.
+
+        Each subfolder's tier+seed is parsed from its name; tier params + seed
+        are applied to the backbone before that folder's images run. Outputs
+        get a T<N>_seed<S>_ prefix on the dataset subdir name to avoid collisions
+        when the same asset runs under multiple (tier, seed) combos.
+
+        Returns shell-style exit code: 0=clean, 1=partial fail, 2=hard fail.
+        """
+        if not batch_parent.is_dir():
+            self.log(f"BATCH FAIL: parent not a directory: {batch_parent}")
+            return 2
+
+        # Discover + parse
+        jobs: list[tuple[str, int, Path, list[Path]]] = []
+        for sub in sorted(batch_parent.iterdir()):
+            if not sub.is_dir():
+                continue
+            parsed = parse_tier_folder(sub)
+            if parsed is None:
+                continue
+            tier_key, seed = parsed
+            images = sorted(
+                p for p in sub.iterdir()
+                if p.is_file() and p.suffix.lower() in VALID_EXT
+                and not p.name.startswith(".") and not p.name.endswith(":Zone.Identifier")
+            )
+            if not images:
+                continue
+            jobs.append((tier_key, seed, sub, images))
+
+        if not jobs:
+            self.log(f"BATCH FAIL: no T<N>_<seed>/ folders with images under {batch_parent}")
+            return 2
+
+        # Order
+        if self.args.batch_order == "largest-first":
+            jobs.sort(key=lambda j: -len(j[3]))
+        elif self.args.batch_order == "random":
+            random.shuffle(jobs)
+        # alphabetical = leave the sorted() order from discovery
+
+        total_imgs = sum(len(j[3]) for j in jobs)
+        self.log("=" * 60)
+        self.log(f"BATCH MODE: {len(jobs)} tier-folders, {total_imgs} total images")
+        self.log(f"  parent: {batch_parent}")
+        self.log(f"  order : {self.args.batch_order}")
+        self.log(f"  on-fail: {self.args.batch_failure_policy}")
+        for tier_key, seed, sub, imgs in jobs:
+            tier_name = SAMPLER_TIERS[tier_key][0]
+            self.log(f"  [queued] T{tier_key} ({tier_name}) seed={seed:<5}  "
+                     f"{len(imgs):>3} images  ({sub.name})")
+        self.log("=" * 60)
+
+        n_done = 0
+        n_failed = 0
+        per_image_times: deque[float] = deque(maxlen=20)
+        batch_start = time.time()
+        signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGTERM, self.shutdown)
+
+        for job_idx, (tier_key, seed, sub, images) in enumerate(jobs, start=1):
+            if self.stopping:
+                break
+            tier_name = SAMPLER_TIERS[tier_key][0]
+            self.log("")
+            self.log("=" * 60)
+            self.log(f"[batch folder {job_idx}/{len(jobs)}] "
+                     f"T{tier_key} ({tier_name}) seed={seed}  "
+                     f"{len(images)} images  ({sub.name})")
+            self.log("=" * 60)
+
+            # Apply tier + seed for this folder. _apply_tier mutates the backbone's
+            # per-sampler dicts; self.args.seed mutates so process_one and the
+            # grain seed pick up the new value.
+            _apply_tier_to_backbone(bb, tier_key)
+            self.args.seed = seed
+            self._batch_dataset_prefix = f"T{tier_key}_seed{seed}_"
+
+            folder_aborted = False
+            for img_idx, img_path in enumerate(images, start=1):
+                if self.stopping:
+                    break
+                self.log(f"  [{job_idx}.{img_idx}/{len(images)}] {img_path.name}")
+                t0 = time.time()
+                try:
+                    self.process_one(bb, envmap, w2c, intr, img_path)
+                    dt = time.time() - t0
+                    per_image_times.append(dt)
+                    n_done += 1
+                    avg = sum(per_image_times) / len(per_image_times)
+                    remaining = total_imgs - (n_done + n_failed)
+                    eta_h = remaining * avg / 3600
+                    elapsed_h = (time.time() - batch_start) / 3600
+                    self.log(f"  ✓ {img_path.name} in {dt:.1f}s  "
+                             f"(batch: {n_done}/{total_imgs} done, {n_failed} failed, "
+                             f"{elapsed_h:.1f}h elapsed, ~{eta_h:.1f}h to go)")
+                except Exception as e:
+                    n_failed += 1
+                    self.log(f"  ✗ FAIL {img_path.name}: {e}")
+                    self.log(traceback.format_exc())
+                    policy = self.args.batch_failure_policy
+                    if policy == "abort-all":
+                        self.log(f"  abort-all: stopping batch "
+                                 f"({n_done} done, {n_failed} failed)")
+                        self._batch_dataset_prefix = ""
+                        return 2
+                    if policy == "abort-folder":
+                        self.log(f"  abort-folder: skipping remaining "
+                                 f"{len(images) - img_idx} images in {sub.name}")
+                        folder_aborted = True
+                        break
+
+            if folder_aborted:
+                continue
+
+        self._batch_dataset_prefix = ""
+        total_h = (time.time() - batch_start) / 3600
+        self.log("")
+        self.log("=" * 60)
+        self.log(f"BATCH COMPLETE: {n_done} done, {n_failed} failed, "
+                 f"{total_h:.2f}h total wall time")
+        self.log("=" * 60)
+        if n_failed == 0:
+            return 0
+        if n_done == 0:
+            return 2
+        return 1
+
     def run(self) -> int:
         self.setup_dirs()
 
@@ -871,14 +1088,22 @@ class Daemon:
             # mesh code path still works via --mode {mesh,both} CLI override.)
             self.args.mode = "splat"
             try:
-                self.args.seed = interactive_select_seed(self.args.seed)
+                # Batch mode first — if yes, skip tier/seed prompts entirely
+                if self.args.batch_tiered is None:
+                    batch_parent = interactive_select_batch_mode(self.hotfolder)
+                    if batch_parent is not None:
+                        self.args.batch_tiered = batch_parent
+                # Common prompts (apply to both modes)
                 self.args.hdri = interactive_select_hdri(self.args.hdri)
                 self.args.force_rembg = interactive_select_force_rembg(self.args.force_rembg)
-                self.args.tier = interactive_select_tier(self.args.tier)
-                if self.args.tier == PROBE_TIER_KEY:
-                    self.args.probe_seed_count = interactive_select_probe_seed_count(
-                        self.args.probe_seed_count
-                    )
+                # Tier/seed prompts only apply to single-tier mode
+                if self.args.batch_tiered is None:
+                    self.args.seed = interactive_select_seed(self.args.seed)
+                    self.args.tier = interactive_select_tier(self.args.tier)
+                    if self.args.tier == PROBE_TIER_KEY:
+                        self.args.probe_seed_count = interactive_select_probe_seed_count(
+                            self.args.probe_seed_count
+                        )
             except EOFError:
                 # Non-interactive stdin (e.g. piped) → fall through with defaults
                 print("(stdin not interactive — using defaults)")
@@ -900,11 +1125,16 @@ class Daemon:
             self.log(f"  views     : {self.args.num_views}")
             self.log(f"  resolution: {self.args.resolution}")
             self.log(f"  chunk     : {self.args.chunk_size}")
-        self.log(f"  seed      : {self.args.seed}")
+        if self.args.batch_tiered is None:
+            self.log(f"  seed      : {self.args.seed}")
         self.log(f"  exposure  : x{self.args.hdri_exposure}")
         self.log(f"  pipeline  : {self.args.pipeline_type}")
         self.log(f"  max_tokens: {self.args.max_num_tokens:,}")
-        if self.args.tier == PROBE_TIER_KEY:
+        if self.args.batch_tiered is not None:
+            self.log(f"  batch     : {self.args.batch_tiered}")
+            self.log(f"  order     : {self.args.batch_order}")
+            self.log(f"  on-fail   : {self.args.batch_failure_policy}")
+        elif self.args.tier == PROBE_TIER_KEY:
             self.log(f"  sampler   : PROBE mode — all 5 tiers at view {PROBE_VIEW}")
             self.log(f"  seeds     : {self.probe_seeds}")
         else:
@@ -949,6 +1179,15 @@ class Daemon:
                 self.args.num_views, radius=self.args.radius, up=up,
             )
             intr = intrinsics_from_fov(self.args.fov, self.args.resolution)
+
+        # --- Batch mode short-circuit: walk T<N>_<seed>/ subfolders and exit ---
+        if self.args.batch_tiered is not None:
+            if self.args.mode == "mesh":
+                self.log("Batch mode requires splat output (mesh-only currently "
+                         "unsupported in batch). Set --mode splat or both.")
+                return 2
+            return self.run_batch(self.args.batch_tiered, bb, envmap, w2c, intr)
+
         self.log(f"Ready. Polling {self.inbox} every "
                  f"{self.args.poll_interval}s. Drop images to process.")
 
