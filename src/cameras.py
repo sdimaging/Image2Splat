@@ -115,28 +115,33 @@ def compute_adaptive_fov(
     margin: float = 0.10,
     fov_min: float = 12.0,
     fov_max: float = 55.0,
+    max_verts: int = 200_000,
 ) -> float:
     """Compute the tightest uniform vertical FOV that contains the mesh silhouette
     from every camera in the trajectory.
 
-    Projects all mesh vertices into each camera's view, finds the worst-case
-    angular extent across all views (max over views of max over verts of
-    max(atan|x|/z, atan|y|/z)), then 2×s and pads by `margin`. Same FOV used
-    across all N views → single PINHOLE camera in COLMAP, schema-identical to
-    legacy fixed-FOV output, every downstream consumer handles it the way they
-    always have.
+    Projects vertices into each camera's view, finds the worst-case angular
+    extent (max over views, max over verts, of max(atan|x|/z, atan|y|/z)), 2×
+    and pads by `margin`. Same FOV across all N views → single PINHOLE camera
+    in COLMAP, schema-identical to legacy fixed-FOV output.
+
+    Memory: O(V) per view, not O(N×V) — we iterate views in a Python loop so a
+    6M-vert mesh × 200 cameras doesn't materialize a 40 GB intermediate tensor.
+
+    For very large meshes (V > max_verts), uniformly random-sub-samples verts
+    before projection. FOV is bounded by silhouette extremes, and 200k random
+    samples hit those extremes with extremely high probability (the convex hull
+    of the random sample tracks the full mesh's convex hull). max_verts=200_000
+    keeps the per-view tensor under 50 MB even at float64.
 
     Args:
         vertices: (V, 3) world-space mesh vertices.
         w2c_matrices: (N, 4, 4) OpenCV world-to-camera matrices — must be the
-            EXACT matrices passed to render_multiview (any mesh-rotation
-            baking already applied).
+            EXACT matrices passed to render_multiview.
         margin: fractional padding on the tight FOV (0.10 = 10% padding).
-        fov_min: lower clamp in degrees. Below this, nvdiffrast precision
-            starts to matter; 12° is a safe floor.
-        fov_max: upper clamp. Above this we'd be looking at mostly empty space;
-            55° is wider than the daemon's legacy fixed 40° so adaptive never
-            enlarges past loose-default territory.
+        fov_min: lower clamp in degrees.
+        fov_max: upper clamp in degrees.
+        max_verts: if V exceeds this, sub-sample uniformly to cap memory.
 
     Returns:
         Scalar float — the worst-view-fits-all FOV in degrees, clamped.
@@ -151,24 +156,37 @@ def compute_adaptive_fov(
         # Degenerate mesh — fall back to fov_max so we definitely don't clip.
         return float(fov_max)
 
-    # Homogeneous projection: (N, V, 4) = (N, 4, 4) @ (V, 4).T via einsum
+    # Sub-sample very large meshes. The FOV-determining verts are silhouette
+    # extremes; a uniform random sample of 200k captures those with vanishing
+    # probability of missing the worst-angle vert by more than rounding noise.
     V = vertices.shape[0]
-    verts_h = np.concatenate([vertices, np.ones((V, 1))], axis=1)
-    verts_cam = np.einsum("nij,vj->nvi", w2c_matrices, verts_h)
-    x = verts_cam[..., 0]
-    y = verts_cam[..., 1]
-    z = verts_cam[..., 2]
+    if V > max_verts:
+        rng = np.random.default_rng(0)  # deterministic — same FOV across runs
+        idx = rng.choice(V, size=max_verts, replace=False)
+        vertices = vertices[idx]
+        V = max_verts
 
-    # Mask verts behind camera (z ≤ 0 in OpenCV convention) before computing atan
-    in_front = z > 1e-3
-    z_safe = np.where(in_front, z, 1.0)
-    theta = np.maximum(
-        np.arctan(np.abs(x) / z_safe),
-        np.arctan(np.abs(y) / z_safe),
-    )
-    theta = np.where(in_front, theta, 0.0)
+    verts_h = np.concatenate([vertices, np.ones((V, 1))], axis=1)  # (V, 4)
 
-    worst = float(theta.max())  # max over (N, V) — worst angle anywhere
+    worst = 0.0
+    for w2c in w2c_matrices:
+        # (V, 4) @ (4, 4).T → (V, 4) — only ~ V*4*8 bytes per view in memory
+        verts_cam = verts_h @ w2c.T
+        x = verts_cam[:, 0]
+        y = verts_cam[:, 1]
+        z = verts_cam[:, 2]
+        in_front = z > 1e-3
+        if not np.any(in_front):
+            continue
+        z_safe = np.where(in_front, z, 1.0)
+        theta = np.maximum(
+            np.arctan(np.abs(x) / z_safe),
+            np.arctan(np.abs(y) / z_safe),
+        )
+        theta_max = float(theta[in_front].max())
+        if theta_max > worst:
+            worst = theta_max
+
     fov_deg = float(np.degrees(2.0 * worst * (1.0 + margin)))
     return float(np.clip(fov_deg, fov_min, fov_max))
 
