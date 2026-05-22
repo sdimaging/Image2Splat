@@ -172,11 +172,12 @@ def parse_tier_folder(folder: Path) -> tuple[str, int] | None:
     return tier_key, seed
 
 
-def interactive_select_batch_mode(default_parent: Path) -> Path | None:
+def interactive_select_batch_mode(inbox: Path) -> Path | None:
     """Ask whether to enter batch mode. Returns parent path or None for normal mode.
 
-    Default parent is `<hotfolder>/processing_aurasr` if it exists, else just
-    the hotfolder itself. User can type a different path at the prompt.
+    Default parent is the daemon's inbox — drop T<N>_<seed>/ folders straight
+    into inbox to batch-run them. User can type a different path at the prompt
+    if they keep tier folders staged elsewhere.
     """
     while True:
         s = input("Batch mode? Walk T<N>_<seed>/ subfolders and apply tier+seed per "
@@ -186,12 +187,9 @@ def interactive_select_batch_mode(default_parent: Path) -> Path | None:
         if s in ("y", "yes"):
             break
         print("  invalid, try again")
-    suggestion = default_parent / "processing_aurasr"
-    if not suggestion.is_dir():
-        suggestion = default_parent
     while True:
-        s = input(f"Batch parent folder [{suggestion}]: ").strip()
-        candidate = Path(s).expanduser() if s else suggestion
+        s = input(f"Batch parent folder [{inbox}]: ").strip()
+        candidate = Path(s).expanduser() if s else inbox
         if not candidate.is_dir():
             print(f"  not a directory: {candidate} — try again or Ctrl-C to bail")
             continue
@@ -484,8 +482,10 @@ def parse_args() -> argparse.Namespace:
     # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
     p.add_argument("--batch-tiered", type=Path, default=None,
                    help="BATCH MODE: parent directory containing T<N>_<seed>/ "
-                        "subfolders (matches the daemon's tier dict). Daemon walks "
-                        "each subfolder, applies the matching tier+seed, runs process_one "
+                        "subfolders (matches the daemon's tier dict). Default expected "
+                        "location: drop tier folders into <hotfolder>/inbox and answer "
+                        "'y' to the batch-mode prompt at startup. Daemon walks each "
+                        "subfolder, applies the matching tier+seed, runs process_one "
                         "on every image inside. Bypasses single-tier hot-folder loop. "
                         "Outputs land in datasets/<slug>/T<N>_seed<seed>_<...>/ so "
                         "re-running the same asset at different (tier, seed) doesn't "
@@ -1060,7 +1060,7 @@ class Daemon:
             try:
                 # Batch mode first — if yes, skip tier/seed prompts entirely
                 if self.args.batch_tiered is None:
-                    batch_parent = interactive_select_batch_mode(self.hotfolder)
+                    batch_parent = interactive_select_batch_mode(self.inbox)
                     if batch_parent is not None:
                         self.args.batch_tiered = batch_parent
                 # Common prompts (apply to both modes)
