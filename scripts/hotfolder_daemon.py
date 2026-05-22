@@ -463,14 +463,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--probe-seed-count", type=int, default=1,
                    help="In probe mode, number of seeds to test (1=just DEFAULT_SEED, "
                         "N=anchor + N-1 randoms). Ignored when --tier != 6.")
-    p.add_argument("--adaptive-fov", choices=["off", "uniform", "per-view"], default="off",
-                   help="Auto-tighten FOV to fit mesh silhouette and reduce wasted "
-                        "negative space in rendered views. "
-                        "off=use fixed --fov (default, current behavior). "
-                        "uniform=one tight FOV across all views (worst-case-fits-all, "
-                        "1-camera COLMAP, identical to legacy output format). "
-                        "per-view=tightest FOV per camera (max detail capture, "
-                        "N-camera COLMAP — multi-camera per-image intrinsics).")
+    p.add_argument("--adaptive-fov", action=argparse.BooleanOptionalAction, default=True,
+                   help="Per-asset adaptive FOV: tighten FOV to fit mesh silhouette "
+                        "(worst-view-fits-all across all cameras). On by default — "
+                        "produces a single PINHOLE camera per dataset (COLMAP-schema "
+                        "identical to legacy fixed-FOV output) but uses the tightest "
+                        "FOV that contains the asset from every view. Pass "
+                        "--no-adaptive-fov to fall back to fixed --fov (legacy mode).")
     p.add_argument("--adaptive-fov-margin", type=float, default=0.10,
                    help="Fractional padding on adaptive FOV (0.10 = 10%% extra margin "
                         "around the tight silhouette fit). Higher = safer, lower = "
@@ -481,7 +480,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--adaptive-fov-max", type=float, default=55.0,
                    help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
                         "the auto-FOV can go; if your default --fov is higher than "
-                        "this, --adaptive-fov off uses --fov as-is.")
+                        "this, --no-adaptive-fov uses --fov as-is.")
     # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
     p.add_argument("--batch-tiered", type=Path, default=None,
                    help="BATCH MODE: parent directory containing T<N>_<seed>/ "
@@ -584,51 +583,26 @@ class Daemon:
 
     def _resolve_adaptive_fov(
         self, mesh_verts_np: np.ndarray, w2c: np.ndarray, intr: dict,
-    ) -> tuple[float, np.ndarray | None, dict | list[dict]]:
-        """Compute effective FOV(s) + intrinsics for the current adaptive-fov mode.
+    ) -> tuple[float, dict]:
+        """Resolve the FOV + intrinsics for this asset.
 
-        Returns:
-            (scalar_fov, per_view_fov_array_or_None, intrinsics_for_export)
-            where intrinsics_for_export is a dict (uniform / off) or a list[dict]
-            (per-view). The caller passes intrinsics_for_export straight to the
-            COLMAP/Nerfstudio writers; per_view_fov_array_or_None drives
-            render_multiview slicing.
+        Returns (fov_deg, intrinsics_dict). When adaptive FOV is enabled (default),
+        computes the worst-view-fits-all FOV from the actual mesh + camera rig,
+        then derives matching intrinsics. When disabled, returns the daemon's
+        fixed --fov and the pre-built intr unchanged.
         """
-        mode = self.args.adaptive_fov
-        if mode == "off":
-            return float(self.args.fov), None, intr
-
-        if mode == "uniform":
-            fov = compute_adaptive_fov(
-                mesh_verts_np, w2c,
-                margin=self.args.adaptive_fov_margin,
-                fov_min=self.args.adaptive_fov_min,
-                fov_max=self.args.adaptive_fov_max,
-                per_view=False,
-            )
-            new_intr = intrinsics_from_fov(fov, self.args.resolution)
-            self.log(f"  adaptive FOV (uniform): {self.args.fov:.1f}° → {fov:.2f}° "
-                     f"(margin {self.args.adaptive_fov_margin:.2f})")
-            return float(fov), None, new_intr
-
-        # per-view
-        fov_arr = compute_adaptive_fov(
+        if not self.args.adaptive_fov:
+            return float(self.args.fov), intr
+        fov = compute_adaptive_fov(
             mesh_verts_np, w2c,
             margin=self.args.adaptive_fov_margin,
             fov_min=self.args.adaptive_fov_min,
             fov_max=self.args.adaptive_fov_max,
-            per_view=True,
         )
-        intr_list = [intrinsics_from_fov(float(f), self.args.resolution)
-                     for f in fov_arr]
-        self.log(f"  adaptive FOV (per-view): "
-                 f"min={float(fov_arr.min()):.2f}°  "
-                 f"max={float(fov_arr.max()):.2f}°  "
-                 f"mean={float(fov_arr.mean()):.2f}°  "
-                 f"(N={len(fov_arr)}, margin {self.args.adaptive_fov_margin:.2f})")
-        # The scalar return value is the mean only as a representative log value;
-        # the rendering path slices fov_arr per chunk, not this scalar.
-        return float(fov_arr.mean()), fov_arr, intr_list
+        new_intr = intrinsics_from_fov(fov, self.args.resolution)
+        self.log(f"  adaptive FOV: {self.args.fov:.1f}° → {fov:.2f}° "
+                 f"(margin {self.args.adaptive_fov_margin:.2f})")
+        return float(fov), new_intr
 
     def process_one(self, bb: Backbone, envmap, w2c, intr,
                     image_path: Path) -> Path:
@@ -684,9 +658,9 @@ class Daemon:
             names: list[str] = []
             n_views = self.args.num_views
 
-            # --- Adaptive FOV computation (mesh-aware tightening) ---
+            # --- Adaptive FOV (per-asset, recomputed for each mesh) ---
             mesh_verts_np = mesh.vertices.detach().cpu().numpy()
-            effective_fov, fov_array, render_intr = self._resolve_adaptive_fov(
+            effective_fov, render_intr = self._resolve_adaptive_fov(
                 mesh_verts_np, w2c, intr,
             )
 
@@ -694,10 +668,8 @@ class Daemon:
                 ck_end = min(ck_start + self.args.chunk_size, n_views)
                 self.log(f"  chunk {ck_start:>3}-{ck_end-1:<3} "
                          f"({ck_end - ck_start} views)")
-                ck_fov = (fov_array[ck_start:ck_end] if fov_array is not None
-                          else effective_fov)
                 frames = render_multiview(
-                    mesh, w2c[ck_start:ck_end], fov_deg=ck_fov,
+                    mesh, w2c[ck_start:ck_end], fov_deg=effective_fov,
                     resolution=self.args.resolution, envmap=envmap,
                     repo_dir=bb.repo_dir, device=bb.device, verbose=False,
                 )
@@ -800,8 +772,7 @@ class Daemon:
                         self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
 
                     # Adaptive FOV for the probe view (per-cell — mesh changes per tier/seed).
-                    # Probe is 1 view, so per-view and uniform collapse to the same scalar.
-                    if self.args.adaptive_fov == "off":
+                    if not self.args.adaptive_fov:
                         cell_fov = float(self.args.fov)
                     else:
                         cell_fov = float(compute_adaptive_fov(
@@ -809,7 +780,6 @@ class Daemon:
                             margin=self.args.adaptive_fov_margin,
                             fov_min=self.args.adaptive_fov_min,
                             fov_max=self.args.adaptive_fov_max,
-                            per_view=False,
                         ))
                         self.log(f"    adaptive FOV: {self.args.fov:.1f}° → {cell_fov:.2f}°")
 
@@ -905,7 +875,7 @@ class Daemon:
             "resolution": self.args.resolution,
             "fov": self.args.fov,
             "adaptive_fov": {
-                "mode": self.args.adaptive_fov,
+                "enabled": bool(self.args.adaptive_fov),
                 "margin": self.args.adaptive_fov_margin,
                 "min_deg": self.args.adaptive_fov_min,
                 "max_deg": self.args.adaptive_fov_max,
@@ -1142,12 +1112,12 @@ class Daemon:
             self.log(f"  sampler   : tier {self.args.tier} ({t_name})  "
                      f"steps={t_steps}  shape={t_sg}  tex={t_tg}")
         self.log(f"  rembg     : {'force BiRefNet' if self.args.force_rembg else 'auto (use input alpha if present)'}")
-        if self.args.adaptive_fov != "off":
-            self.log(f"  adapt-FOV : {self.args.adaptive_fov}  "
+        if self.args.adaptive_fov:
+            self.log(f"  adapt-FOV : ON  per-asset uniform  "
                      f"(margin {self.args.adaptive_fov_margin:.2f}, "
                      f"clamp {self.args.adaptive_fov_min:.0f}-{self.args.adaptive_fov_max:.0f}°)")
         else:
-            self.log(f"  adapt-FOV : off (fixed {self.args.fov}°)")
+            self.log(f"  adapt-FOV : OFF — fixed {self.args.fov}°")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)

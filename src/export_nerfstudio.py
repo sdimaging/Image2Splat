@@ -28,7 +28,7 @@ def write_nerfstudio_dataset(
     output_path: str | Path,
     w2c_matrices: np.ndarray,
     image_names: list[str] | Iterable[str],
-    intrinsics: dict | list[dict],
+    intrinsics: dict,
     image_subdir: str = "images",
     aabb_scale: int = 2,
 ) -> Path:
@@ -40,10 +40,8 @@ def write_nerfstudio_dataset(
                      `<output_path>/transforms.json`.
         w2c_matrices: (N, 4, 4) OpenCV world-to-camera matrices.
         image_names: filenames of N rendered images.
-        intrinsics: dict (one shared camera for all frames — top-level fl_x/fl_y/cx/cy)
-                    OR a list[dict] of length N (per-frame intrinsics — Nerfstudio
-                    supports `fl_x`/`fl_y`/`cx`/`cy`/`w`/`h` INSIDE each frame entry,
-                    which overrides top-level values).
+        intrinsics: dict with fx, fy, cx, cy, width, height (cameras.intrinsics_from_fov).
+                    Single shared camera across all frames.
         image_subdir: directory name to prepend to each image filename in `file_path`.
                       Defaults to "images" to match the standard Nerfstudio layout.
         aabb_scale: scene bounding box scale hint for Nerfstudio. 2.0 covers our
@@ -63,45 +61,24 @@ def write_nerfstudio_dataset(
             f"matrices ({len(w2c_matrices)}) and names ({len(image_names)}) length mismatch"
         )
 
-    multi_cam = not isinstance(intrinsics, dict)
-    if multi_cam:
-        intr_list = list(intrinsics)
-        if len(intr_list) != len(image_names):
-            raise ValueError(
-                f"intrinsics list length {len(intr_list)} != n_images {len(image_names)}"
-            )
-        # Top-level fields use first frame as a fallback for tools that don't
-        # honor per-frame overrides (Nerfstudio's standard path DOES honor them).
-        top_intr = intr_list[0]
-    else:
-        intr_list = None
-        top_intr = intrinsics
-
     frames = []
-    for idx, (w2c, name) in enumerate(zip(w2c_matrices, image_names)):
+    for w2c, name in zip(w2c_matrices, image_names):
         c2w_opengl = opencv_w2c_to_opengl_c2w(w2c)
-        frame = {
-            "file_path": f"{image_subdir}/{name}" if image_subdir else name,
-            "transform_matrix": c2w_opengl.tolist(),
-        }
-        if multi_cam:
-            per = intr_list[idx]
-            frame["fl_x"] = float(per["fx"])
-            frame["fl_y"] = float(per["fy"])
-            frame["cx"] = float(per["cx"])
-            frame["cy"] = float(per["cy"])
-            frame["w"] = int(per["width"])
-            frame["h"] = int(per["height"])
-        frames.append(frame)
+        frames.append(
+            {
+                "file_path": f"{image_subdir}/{name}" if image_subdir else name,
+                "transform_matrix": c2w_opengl.tolist(),
+            }
+        )
 
     payload = {
         "camera_model": "OPENCV",
-        "fl_x": float(top_intr["fx"]),
-        "fl_y": float(top_intr["fy"]),
-        "cx": float(top_intr["cx"]),
-        "cy": float(top_intr["cy"]),
-        "w": int(top_intr["width"]),
-        "h": int(top_intr["height"]),
+        "fl_x": float(intrinsics["fx"]),
+        "fl_y": float(intrinsics["fy"]),
+        "cx": float(intrinsics["cx"]),
+        "cy": float(intrinsics["cy"]),
+        "w": int(intrinsics["width"]),
+        "h": int(intrinsics["height"]),
         "aabb_scale": int(aabb_scale),
         "frames": frames,
     }

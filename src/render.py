@@ -53,7 +53,7 @@ def render_multiview(
     mesh,
     w2c_matrices: np.ndarray,
     *,
-    fov_deg: float | np.ndarray = 40.0,
+    fov_deg: float = 40.0,
     resolution: int = 1024,
     bg_color: tuple[float, float, float] = (0.0, 0.0, 0.0),
     envmap=None,
@@ -66,9 +66,7 @@ def render_multiview(
     Args:
         mesh: a MeshWithVoxel as returned by Backbone.run() / pipeline.run()
         w2c_matrices: (N, 4, 4) OpenCV W2C matrices (numpy). Use cameras.generate_camera_trajectory.
-        fov_deg: vertical FOV in degrees. Accepts a scalar (uniform across all
-            views) or a (N,) array (per-view tight FOV — pair with multi-camera
-            COLMAP/Nerfstudio export).
+        fov_deg: vertical FOV in degrees, applied uniformly across all views.
         resolution: output image edge length in pixels.
         bg_color: solid background tuple (0..1). For alpha-masked output, the
                   caller can post-process the alpha channel; setting bg here just
@@ -100,14 +98,7 @@ def render_multiview(
     extrinsics = [
         torch.tensor(m, dtype=torch.float32, device=device) for m in w2c_matrices
     ]
-    fov_arr = np.atleast_1d(np.asarray(fov_deg, dtype=np.float64))
-    if fov_arr.size == 1:
-        fov_arr = np.full(len(w2c_matrices), float(fov_arr.item()))
-    elif fov_arr.size != len(w2c_matrices):
-        raise ValueError(
-            f"fov_deg must be scalar or length {len(w2c_matrices)}, got {fov_arr.size}"
-        )
-    intrinsics = [_normalized_intrinsics_from_fov(float(f), device) for f in fov_arr]
+    intrinsics = [_normalized_intrinsics_from_fov(fov_deg, device)] * len(w2c_matrices)
 
     options = {"resolution": resolution, "bg_color": bg_color}
     render_kwargs = {}
