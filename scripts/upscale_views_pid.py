@@ -111,6 +111,14 @@ def parse_args() -> argparse.Namespace:
                    help="Text condition for the diffusion decoder. flux2/sd3 "
                         "are text-conditional even in image-to-image mode — a "
                         "neutral prompt works fine for rendered mesh views.")
+    p.add_argument("--input-resolution", type=int, default=None,
+                   help="If set, frames are center-cropped + resized to this "
+                        "before PiD encode. Output is --scale × this. Use 1024 "
+                        "with --scale 4 to produce 4096px output from any input "
+                        "(safe on 32 GB VRAM). If omitted, the input keeps its "
+                        "native resolution and output is --scale × native — "
+                        "BEWARE: a 3000px input would target 12000px output "
+                        "which OOMs the 5090.")
     p.add_argument("--output-suffix", type=str, default="_pid{scale}x",
                    help="Suffix appended to dataset folder name for output. "
                         "{scale} is replaced with --scale.")
@@ -252,7 +260,6 @@ def main() -> int:
         args.pid_python, "-m", pid_module,
         "--manifest", str(manifest_path),
         "--output_dir", str(pid_output_dir),
-        "--keep_input_size",
         "--scale", str(args.scale),
         "--pid_inference_steps", str(args.steps),
         "--cfg_scale", str(args.cfg_scale),
@@ -262,6 +269,14 @@ def main() -> int:
         "--prompt", args.prompt,
         "--save_format", "png",  # match daemon render output, no JPEG recompression
     ]
+    # Resolution: --keep_input_size by default (matches a 1024px native render
+    # which is the Strategy A target); override with --input-resolution to
+    # downsample first (useful for testing against a higher-res existing dataset
+    # without OOMing).
+    if args.input_resolution is not None:
+        cli += ["--input_resolution", str(args.input_resolution)]
+    else:
+        cli += ["--keep_input_size"]
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{args.pid_repo}:{env.get('PYTHONPATH', '')}"
 
