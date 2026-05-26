@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
                    help="Fixed seed across all frames — maximizes view "
                         "consistency for splat training. Same diffusion noise "
                         "applied to every frame.")
+    p.add_argument("--prompt", type=str,
+                   default="a high resolution photograph of a 3d object on a "
+                           "neutral background, ultra-detailed, sharp focus",
+                   help="Text condition for the diffusion decoder. flux2/sd3 "
+                        "are text-conditional even in image-to-image mode — a "
+                        "neutral prompt works fine for rendered mesh views.")
     p.add_argument("--output-suffix", type=str, default="_pid{scale}x",
                    help="Suffix appended to dataset folder name for output. "
                         "{scale} is replaced with --scale.")
@@ -253,6 +259,8 @@ def main() -> int:
         "--pid_ckpt_type", args.ckpt_type,
         "--degrade_sigmas", "0.0",
         "--seed", str(args.seed),
+        "--prompt", args.prompt,
+        "--save_format", "png",  # match daemon render output, no JPEG recompression
     ]
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{args.pid_repo}:{env.get('PYTHONPATH', '')}"
