@@ -30,6 +30,7 @@ import random
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -147,6 +148,24 @@ def interactive_select_probe_seed_count(default: int = 1, max_seeds: int = 8) ->
         except ValueError:
             pass
         print(f"  invalid, pick 1-{max_seeds}")
+
+
+# Error signatures that mean the CUDA context is dead and no further GPU work
+# can succeed in this process. Triggers: Windows TDR resets, driver hiccups,
+# allocator corruption. Once seen, only a process restart recovers.
+CUDA_FATAL_PATTERNS = (
+    "CUDA driver error",
+    "device not ready",
+    "CUDACachingAllocator",
+    "CUDA error",
+    "INTERNAL ASSERT FAILED",
+    "device-side assert",
+)
+
+
+def _is_cuda_fatal(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(p in msg for p in CUDA_FATAL_PATTERNS)
 
 
 TIER_SEED_RE = re.compile(r"^T(\d+)_(\d+)$")
@@ -502,6 +521,18 @@ def parse_args() -> argparse.Namespace:
                         "(default, robust for overnight runs); abort-folder=skip remaining "
                         "images in the current tier folder, move to next folder; "
                         "abort-all=stop the entire batch immediately.")
+    # --- TripoSplat quick-splat companion output ---
+    p.add_argument("--quick-splat", action=argparse.BooleanOptionalAction, default=True,
+                   help="Also produce a fast feed-forward TripoSplat Gaussian splat "
+                        "(~25s/asset incl. model load, runs as an isolated subprocess "
+                        "before mesh generation so VRAM never overlaps with rendering). "
+                        "Output lands in datasets/<slug>/quick_splat/ — a browser-viewable "
+                        ".splat + PostShot-ingestible .ply preview alongside the full "
+                        "COLMAP dataset. Requires ~/projects/TripoSplat with weights. "
+                        "Failure is non-fatal (logged, pipeline continues).")
+    p.add_argument("--triposplat-repo", type=Path,
+                   default=Path.home() / "projects" / "TripoSplat",
+                   help="Path to the TripoSplat repo + ckpts/ for --quick-splat.")
     return p.parse_args()
 
 
@@ -604,11 +635,51 @@ class Daemon:
                  f"(margin {self.args.adaptive_fov_margin:.2f})")
         return float(fov), new_intr
 
+    def run_quick_splat(self, image_path: Path, slug_root: Path) -> None:
+        """Produce a TripoSplat quick-splat preview as an isolated subprocess.
+
+        Runs BEFORE mesh generation while the GPU is at idle baseline — the
+        subprocess holds ~7.5 GB only for its ~25s lifetime and fully releases
+        on exit, so it never overlaps with Pixal3D's 20 GB render peaks.
+        Non-fatal on any failure: a missing TripoSplat install or a bad input
+        just logs a warning and the main pipeline continues.
+        """
+        out_dir = slug_root / "quick_splat"
+        if any(out_dir.glob("quick_splat_*.splat")):
+            self.log(f"  quick-splat: already exists, skipping")
+            return
+        script = Path(__file__).resolve().parent / "quick_splat.py"
+        if not script.exists():
+            self.log(f"  quick-splat WARN: {script} not found, skipping")
+            return
+        t0 = time.time()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), str(image_path), str(out_dir),
+                 "--triposplat-repo", str(self.args.triposplat_repo),
+                 "--seed", str(self.args.seed)],
+                capture_output=True, text=True, timeout=300,
+            )
+            tail = (result.stdout or "").strip().splitlines()
+            msg = tail[-1] if tail else "(no output)"
+            if result.returncode == 0:
+                self.log(f"  quick-splat ✓ ({time.time() - t0:.1f}s) → {out_dir}")
+            else:
+                self.log(f"  quick-splat WARN (rc={result.returncode}): {msg}")
+        except subprocess.TimeoutExpired:
+            self.log(f"  quick-splat WARN: timed out after 300s, continuing")
+        except OSError as e:
+            self.log(f"  quick-splat WARN: {e}")
+
     def process_one(self, bb: Backbone, envmap, w2c, intr,
                     image_path: Path) -> Path:
         slug = slug_for(image_path)
         slug_root = self.datasets / slug
         mode = self.args.mode
+
+        # TripoSplat quick-splat companion (isolated subprocess, GPU-idle window)
+        if self.args.quick_splat:
+            self.run_quick_splat(image_path, slug_root)
 
         # Dataset subdir name (per-config); batch mode prefixes with T<N>_seed<S>_ to
         # keep multi-(tier, seed) runs of the same asset side-by-side without colliding.
@@ -731,6 +802,7 @@ class Daemon:
         # Per-cell production data accumulated here
         cells: list[dict] = []
         n_skipped = 0
+        cuda_fatal = False
         batch_start = time.time()
         started_at = datetime.now().isoformat()
         input_w, input_h = image.size
@@ -854,6 +926,20 @@ class Daemon:
                         "seed": seed,
                         "error": str(e),
                     })
+                    if _is_cuda_fatal(e):
+                        # The CUDA context is poisoned — every subsequent cell
+                        # would fail in seconds (lived this 2026-06-02: one
+                        # "device not ready" → 19 cascade FAILs + zombie daemon).
+                        # Abort the asset AND stop the daemon; a fresh process
+                        # is the only reliable recovery.
+                        self.log("  ✗ CUDA-FATAL: context unrecoverable — aborting "
+                                 "asset and stopping daemon. Restart to continue "
+                                 "(skip-existing will resume).")
+                        cuda_fatal = True
+                        self.stopping = True
+                        break
+            if self.stopping:
+                break
 
         total_wall = time.time() - batch_start
         meta = {
@@ -906,6 +992,13 @@ class Daemon:
             (probe_dir / "probe_summary.md").write_text(_build_probe_summary_md(meta))
         except OSError:
             pass
+
+        if cuda_fatal:
+            # Meta is written for diagnosis, but the asset must NOT be marked
+            # complete — raise so the outer loop moves the source to failed/.
+            raise RuntimeError(
+                f"CUDA-fatal abort during probe ({len(cells)}/{n_total} cells attempted)"
+            )
 
         self.log(f"  ✓ probe complete → {probe_dir} ({len(cells)} cells in {total_wall/60:.1f} min)")
         return slug_root
@@ -1017,6 +1110,14 @@ class Daemon:
                     n_failed += 1
                     self.log(f"  ✗ FAIL {img_path.name}: {e}")
                     self.log(traceback.format_exc())
+                    if _is_cuda_fatal(e):
+                        # Poisoned CUDA context — overrides failure policy.
+                        # No further GPU work can succeed in this process.
+                        self.log("  ✗ CUDA-FATAL: context unrecoverable — stopping "
+                                 "batch. Restart daemon to resume (skip-existing "
+                                 "picks up where this left off).")
+                        self._batch_dataset_prefix = ""
+                        return 2
                     policy = self.args.batch_failure_policy
                     if policy == "abort-all":
                         self.log(f"  abort-all: stopping batch "
@@ -1118,6 +1219,7 @@ class Daemon:
                      f"clamp {self.args.adaptive_fov_min:.0f}-{self.args.adaptive_fov_max:.0f}°)")
         else:
             self.log(f"  adapt-FOV : OFF — fixed {self.args.fov}°")
+        self.log(f"  quick-splat: {'ON (TripoSplat preview per asset)' if self.args.quick_splat else 'off'}")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)
@@ -1204,6 +1306,10 @@ class Daemon:
                     except OSError:
                         pass
                     torch.cuda.empty_cache()
+                    if _is_cuda_fatal(e):
+                        self.log("✗ CUDA-FATAL: context unrecoverable — daemon "
+                                 "exiting. Restart to continue processing.")
+                        self.stopping = True
             except KeyboardInterrupt:
                 break
             except Exception as e:

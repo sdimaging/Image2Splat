@@ -116,6 +116,12 @@ def _parse_current_state(log_lines: list[str]) -> dict:
             if m:
                 state["current_cell"] = f"{m.group(2)}/{m.group(3)}"
                 state["mode"] = "batch"
+        # Batch-mode tier banner: "[batch folder J/K] T<N> (Name) seed=S  ..."
+        if state["mode"] == "batch" and state["current_tier"] is None:
+            m = re.search(r"\[batch folder \d+/\d+\]\s+T(\d+)\s+\((\w+)\)\s+seed=(\d+)", line)
+            if m:
+                state["current_tier"] = f"T{m.group(1)} ({m.group(2)})"
+                state["current_seed"] = m.group(3)
         # Most-recent INFER or PROBE start
         if state["current_asset"] is None:
             m = re.search(r"(?:INFER|PROBE)\s+(\S+\.\w+)\s+→", line)
