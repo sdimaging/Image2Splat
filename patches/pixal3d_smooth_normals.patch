@@ -1,0 +1,79 @@
+diff --git a/pixal3d/pipelines/pixal3d_image_to_3d.py b/pixal3d/pipelines/pixal3d_image_to_3d.py
+index 7129482..f28f02b 100644
+--- a/pixal3d/pipelines/pixal3d_image_to_3d.py
++++ b/pixal3d/pipelines/pixal3d_image_to_3d.py
+@@ -651,9 +651,16 @@ class Pixal3DImageTo3DPipeline(Pipeline):
+             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
+             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+             hr_resolution = 1536
++        elif pipeline_type == '2048_cascade':
++            # EXPERIMENTAL: pushes the 1024-trained models to 2048-axis latent grid.
++            # OOD for the texture/shape models — may produce noise on some inputs.
++            assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
++            assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
++            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
++            hr_resolution = 2048
+         else:
+             raise ValueError(f"Invalid pipeline type for Pixal3D proj mode: {pipeline_type}. "
+-                             f"Supported: '1024_cascade', '1536_cascade'.")
++                             f"Supported: '1024_cascade', '1536_cascade', '2048_cascade'.")
+ 
+         # Validate image_cond_models are set
+         assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
+diff --git a/pixal3d/renderers/pbr_mesh_renderer.py b/pixal3d/renderers/pbr_mesh_renderer.py
+index 14ded30..6e479c5 100644
+--- a/pixal3d/renderers/pbr_mesh_renderer.py
++++ b/pixal3d/renderers/pbr_mesh_renderer.py
+@@ -319,6 +319,21 @@ class PbrMeshRenderer:
+         e0 = v1 - v0
+         e1 = v2 - v0
+         face_normal = torch.cross(e0, e1, dim=1)
++        # Smooth (Phong) vertex normals: area-weighted accumulation of the
++        # unnormalized face cross-products (magnitude = 2*area), normalized
++        # per vertex. Flat per-face shading made large QEM-decimated triangles
++        # visible as hard facets on smooth glossy surfaces (metal helms etc.) —
++        # the decimator strips low-curvature regions to few big triangles, and
++        # one normal per face turns each into a visible lighting plateau.
++        # QEM keeps creases densely triangulated, so smoothing does not
++        # visibly round hard edges.
++        vertex_normal = torch.zeros(
++            (vertices.shape[1], 3), dtype=face_normal.dtype, device=face_normal.device
++        )
++        vertex_normal.index_add_(
++            0, faces.reshape(-1).long(), face_normal.repeat_interleave(3, dim=0)
++        )
++        vertex_normal = F.normalize(vertex_normal, dim=1)
+         face_normal = F.normalize(face_normal, dim=1)
+         
+         out_dict = edict()
+@@ -337,8 +352,10 @@ class PbrMeshRenderer:
+                 # Depth
+                 gb_depth = dr.interpolate(vertices_camera[..., 2:3].contiguous(), rast, faces)[0][0]
+                         
+-                # Normal
+-                gb_normal = dr.interpolate(face_normal.unsqueeze(0), rast, torch.arange(face_normal.shape[0], dtype=torch.int, device=self.device).unsqueeze(1).repeat(1, 3).contiguous())[0][0]
++                # Normal — interpolate smooth vertex normals across each face
++                # (true Phong shading), renormalize per pixel.
++                gb_normal = dr.interpolate(vertex_normal.unsqueeze(0), rast, faces)[0][0]
++                gb_normal = F.normalize(gb_normal, dim=-1)
+                 gb_normal = torch.where(
+                     torch.sum(gb_normal * (pos - rays_o), dim=-1, keepdim=True) > 0,
+                     -gb_normal,
+diff --git a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py b/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
+index a51e752..a45f4bd 100644
+--- a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
++++ b/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
+@@ -453,7 +453,12 @@ class DinoV3ProjFeatureExtractor(nn.Module):
+         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
+         position_embeddings = self.model.rope_embeddings(image)
+ 
+-        for layer_module in self.model.layer:
++        # transformers 5.x nests DINOv3 encoder layers at model.model.layer
++        # (older transformers had them at model.layer). Support both.
++        encoder_layers = getattr(self.model, "layer", None)
++        if encoder_layers is None:
++            encoder_layers = self.model.model.layer
++        for layer_module in encoder_layers:
+             hidden_states = layer_module(
+                 hidden_states,
+                 position_embeddings=position_embeddings,
