@@ -122,10 +122,27 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
 
     normals = compute_vertex_normals(vertices, fi)
 
+    # --- vertex-graph-smoothed normals -------------------------------------
+    # Raw per-vertex normals carry the mesh's vertex-scale roughness. Every
+    # downstream use (triplanar weights, projection, displacement direction)
+    # must use a SMOOTH field, or the roughness modulates the displacement
+    # and injects high-frequency noise into the surface (measured +50-77%
+    # normal-channel HF energy when raw normals leak in anywhere).
+    v_src = torch.cat([fi[:, 0], fi[:, 1], fi[:, 2], fi[:, 1], fi[:, 2], fi[:, 0]])
+    v_dst = torch.cat([fi[:, 1], fi[:, 2], fi[:, 0], fi[:, 0], fi[:, 1], fi[:, 2]])
+    vdeg_n = torch.zeros((vertices.shape[0], 1), device=device, dtype=dtype)
+    vdeg_n.index_add_(0, v_dst, torch.ones((v_dst.shape[0], 1), device=device, dtype=dtype))
+    vdeg_n = vdeg_n.clamp(min=1.0)
+    n_filt = normals
+    for _ in range(8):
+        acc = torch.zeros_like(n_filt)
+        acc.index_add_(0, v_dst, n_filt[v_src])
+        n_filt = F.normalize(n_filt + acc / vdeg_n, dim=1)
+
     # --- cluster key: grid cell + 6-way normal bin ------------------------
     gi = ((vertices - lo) / cell).long()
-    dom = normals.abs().argmax(dim=1)
-    sign_neg = (torch.gather(normals, 1, dom.unsqueeze(1)).squeeze(1) < 0).long()
+    dom = n_filt.abs().argmax(dim=1)
+    sign_neg = (torch.gather(n_filt, 1, dom.unsqueeze(1)).squeeze(1) < 0).long()
     nbin = dom * 2 + sign_neg
     G = int(gi.max().item()) + 1
     key = ((gi[:, 0] * G + gi[:, 1]) * G + gi[:, 2]) * 6 + nbin
@@ -173,7 +190,7 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
     nsum = torch.zeros((C, 3), device=device, dtype=dtype)
     nsum.index_add_(0, inv, normals)
     R = nsum.norm(dim=1) / counts
-    coherence = ((R - 0.7) / 0.25).clamp(0.0, 1.0)
+    coherence = ((R - 0.85) / 0.12).clamp(0.0, 1.0)
 
     # --- interpolate the band to vertices (kills cluster-border steps) ----
     # The band is per-cluster; applied as-is it is piecewise-constant over
@@ -188,7 +205,8 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
     c_iz = rest % G
     c_iy = (rest // G) % G
     c_ix = rest // (G * G)
-    dense = torch.zeros((6, 8, G + 1, G + 1, G + 1), device=device, dtype=dtype)
+    cluster_n = F.normalize(nsum, dim=1)                 # smoothed normal field
+    dense = torch.zeros((6, 11, G + 1, G + 1, G + 1), device=device, dtype=dtype)
     dense[c_bin, 0, c_ix, c_iy, c_iz] = band[:, 0]
     dense[c_bin, 1, c_ix, c_iy, c_iz] = band[:, 1]
     dense[c_bin, 2, c_ix, c_iy, c_iz] = band[:, 2]
@@ -197,6 +215,9 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
     dense[c_bin, 5, c_ix, c_iy, c_iz] = centroid[:, 0]   # for shell-thickness
     dense[c_bin, 6, c_ix, c_iy, c_iz] = centroid[:, 1]
     dense[c_bin, 7, c_ix, c_iy, c_iz] = centroid[:, 2]
+    dense[c_bin, 8, c_ix, c_iy, c_iz] = cluster_n[:, 0]  # smooth displacement dir
+    dense[c_bin, 9, c_ix, c_iy, c_iz] = cluster_n[:, 1]
+    dense[c_bin, 10, c_ix, c_iy, c_iz] = cluster_n[:, 2]
 
     # cluster value sits at the cell CENTER -> sample at (pos/cell - 0.5).
     # TRIPLANAR bin blending: hard per-vertex bin assignment makes adjacent
@@ -209,14 +230,16 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
     f = p.floor()
     w = p - f
     f = f.long().clamp(max=G - 1)
-    wpos = normals.clamp(min=0.0) ** 2                    # +x +y +z
-    wneg = (-normals).clamp(min=0.0) ** 2                 # -x -y -z
+    wpos = n_filt.clamp(min=0.0) ** 2                     # +x +y +z
+    wneg = (-n_filt).clamp(min=0.0) ** 2                  # -x -y -z
     tri_w = torch.cat([
         wpos[:, 0:1], wneg[:, 0:1],
         wpos[:, 1:2], wneg[:, 1:2],
         wpos[:, 2:3], wneg[:, 2:3]], dim=1)               # [V, 6] bin order = axis*2+sign
-    samp = torch.zeros((5, vertices.shape[0]), device=device, dtype=dtype)
-    flat_grid = dense.view(6, 8, -1)
+    # blended channels: band(3) + coherence + weight + smooth normal(3)
+    ch = torch.tensor([0, 1, 2, 3, 4, 8, 9, 10], device=device)
+    samp = torch.zeros((8, vertices.shape[0]), device=device, dtype=dtype)
+    flat_grid = dense.view(6, 11, -1)
     S = (G + 1)
     corner_cache = []
     for dx in (0, 1):
@@ -233,9 +256,10 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
         if not sel.any():
             continue
         idxs = sel.nonzero(as_tuple=True)[0]
-        sb = torch.zeros((5, idxs.shape[0]), device=device, dtype=dtype)
+        sb = torch.zeros((8, idxs.shape[0]), device=device, dtype=dtype)
+        gb = flat_grid[b][ch]
         for idx, wt in corner_cache:
-            sb += flat_grid[b, :5, idx[idxs]] * wt[idxs].unsqueeze(0)
+            sb += gb[:, idx[idxs]] * wt[idxs].unsqueeze(0)
         samp[:, idxs] += sb * wb[idxs].unsqueeze(0)
 
     # --- local shell thickness from the OPPOSITE normal bin ---------------
@@ -253,13 +277,19 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
         opp[3] += flat_grid[b_opp, 4, idx] * wt
     has_opp = opp[3] > 1e-6
     opp_pos = (opp[:3] / opp[3].clamp(min=1e-8)).T
-    thickness = ((vertices - opp_pos) * normals).sum(dim=1).abs()
     wsum = samp[4].clamp(min=1e-8)
     band_v = (samp[:3] / wsum).T
     coh_v = samp[3] / wsum
+    # Smooth displacement DIRECTION: raw per-vertex normals carry the
+    # mesh's vertex-scale roughness; displacing along them injects
+    # high-frequency noise everywhere the correction is active (measured
+    # +53-77% normal-channel HF energy). The interpolated cluster-mean
+    # normal field is smooth at the 1.6% cluster scale.
+    n_smooth = F.normalize((samp[5:8] / wsum).T, dim=1)
     empty = samp[4] < 1e-6
     band_v[empty] = band[inv][empty]      # fallback: own cluster's band
     coh_v[empty] = coherence[inv][empty]
+    n_smooth[empty] = n_filt[empty]
     # Interpolation pulls rim/detail coherence UP toward neighboring flat
     # panels — exactly where suppression matters most (curling rims notch
     # the silhouette because the displacement DIRECTION rotates with the
@@ -301,11 +331,20 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
             bflag = torch.maximum(bflag * 0.5 + 0.5 * acc / vdeg, bflag * 0.0)
             bflag = bflag.clamp(0.0, 1.0)
 
-    # --- apply: normal projection + soft amplitude gate + coherence -------
-    d_n = (band_v * normals).sum(dim=1, keepdim=True)
+    # --- apply: smooth-normal projection + amplitude DISCRIMINATION -------
+    # Scale alone cannot separate plateau noise from real mid-band features
+    # (flutes/straps live at plateau wavelength). Amplitude can: plateaus
+    # are SHALLOW (<~gate), features are DEEP. A saturating gate (tanh)
+    # still applies gate-sized displacement at feature edges and chews
+    # them (measured: added HF noise traces every flute/strap/rivet).
+    # Derivative-of-Gaussian gate instead: ~identity for |band| <= gate,
+    # decays to ZERO for |band| >> gate — features are left untouched.
+    thickness = ((vertices - opp_pos) * n_smooth).sum(dim=1).abs()
+    d_n = (band_v * n_smooth).sum(dim=1, keepdim=True)
     gate = diag * gate_frac
     gated_frac = float((d_n.abs() > gate).float().mean())
-    d_n = gate * torch.tanh(d_n / gate)
+    sigma = 1.5 * gate
+    d_n = d_n * torch.exp(-0.5 * (d_n / sigma) ** 2)
     d_n = d_n * coh_v.clamp(0.0, 1.0).unsqueeze(1)
     d_n = d_n * (1.0 - bflag).unsqueeze(1)
     # shell-thickness cap: each side may use 35% of the local thickness
@@ -314,7 +353,7 @@ def plateau_smooth(vertices: torch.Tensor, faces: torch.Tensor,
                         torch.full_like(thickness, float("inf"))).unsqueeze(1)
     d_n = torch.clamp(d_n, -t_cap, t_cap)
 
-    disp = alpha * d_n * normals
+    disp = alpha * d_n * n_smooth
     new_vertices = vertices - disp
 
     mag = disp.norm(dim=1)

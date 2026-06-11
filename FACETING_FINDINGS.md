@@ -48,7 +48,26 @@ proportionally. Geometry plateaus still exist; this is a partial fix.
 Patch updated: `patches/pixal3d_smooth_normals.patch` includes the SSAO change.
 A/B composite images: `/tmp/facet_diag_ab_chest/AB_comparison.png`
 
-## Fix 4: plateau geometry band-stop (SHIPPED 2026-06-11) — the root-cause fix
+## Fix 4: plateau geometry band-stop — EXPERIMENTAL, default OFF (2026-06-11)
+
+**STATUS CORRECTION (same day):** initially shipped default-ON; flipped to
+default-OFF after measurement. The filter softens plateaus (breastplate
+lum ratio 2.06 -> 1.91 at full strength) but ADDS high-frequency
+normal-field noise (+40-70% Laplacian energy, measured), concentrated at
+feature edges (flutes/straps/rivets — heatmap-localized). Root tension:
+flutes live at the same WAVELENGTH as plateaus; only amplitude separates
+them, and every gate strong enough to protect features also weakens the
+plateau correction (v11: ratio 2.06 -> 2.01, still +41% HF). For a splat
+pipeline this is disqualifying — PostShot bakes the noise in from 200
+views. 11 design iterations are documented in mesh_smooth.py's docstring;
+the module stays for experimentation via `--geo-smooth` (opt-in).
+
+Practical alternatives, in order: seed auto-ranking (plateau-metric
+scoring of probe cells), Hunyuan 3.1 mesh comparison (clean-topology API
+meshes may not facet at all), SDF-level smoothing inside the decode.
+
+<details><summary>Original (over-optimistic) ship notes</summary>
+
 `scripts/mesh_smooth.py::plateau_smooth` — surface-aware removal of the
 plateau-band undulation from the mesh itself, post-decimation, <1s on 7.5M
 verts. Wired into the daemon as `--geo-smooth` (default ON) in BOTH the
@@ -83,6 +102,8 @@ In patches/pixal3d_smooth_normals.patch.
 
 Tooling: `diagnose_facets.py --geo-compare` (A/B on one inference) and
 `--mesh-cache` (torch.save the mesh; render-only iteration ~40s vs ~9min).
+
+</details>
 
 ## Remaining candidate steps
 1. **SDF/voxel-grid smoothing** before mesh extraction (attacks root even

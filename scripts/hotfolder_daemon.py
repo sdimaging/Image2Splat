@@ -498,15 +498,16 @@ def parse_args() -> argparse.Namespace:
                    help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
                         "the auto-FOV can go; if your default --fov is higher than "
                         "this, --no-adaptive-fov uses --fov as-is.")
-    # --- Plateau geometry smoothing (metal-faceting fix) ---
-    p.add_argument("--geo-smooth", action=argparse.BooleanOptionalAction, default=True,
-                   help="Surface-aware plateau band-stop on the generated mesh "
-                        "(mesh_smooth.plateau_smooth, runs post-decimation, <2s). "
-                        "Removes the 5-15%%-wavelength geometric undulation that "
-                        "reads as polygonal facets on glossy metal, while a "
-                        "0.5%%-of-bbox amplitude gate preserves real features "
-                        "(teeth, straps, engraving). Pass --no-geo-smooth to "
-                        "render the raw decode.")
+    # --- Plateau geometry smoothing (EXPERIMENTAL — metal-faceting fix) ---
+    p.add_argument("--geo-smooth", action=argparse.BooleanOptionalAction, default=False,
+                   help="EXPERIMENTAL: surface-aware plateau band-stop on the "
+                        "generated mesh (mesh_smooth.plateau_smooth, post-"
+                        "decimation, <2s). Softens the 5-15%%-wavelength "
+                        "geometric plateaus that read as facets on glossy "
+                        "metal, BUT currently adds ~40%% high-frequency "
+                        "normal-field noise concentrated at feature edges — "
+                        "not production quality (2026-06-11, see "
+                        "FACETING_FINDINGS.md). Default OFF.")
     p.add_argument("--geo-smooth-alpha", type=float, default=1.0,
                    help="Fraction of the isolated plateau band to remove (0-1).")
     # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
@@ -1270,7 +1271,7 @@ class Daemon:
         else:
             self.log(f"  adapt-FOV : OFF — fixed {self.args.fov}°")
         self.log(f"  quick-splat: {'ON (TripoSplat preview per asset)' if self.args.quick_splat else 'off'}")
-        self.log(f"  geo-smooth : {'ON (plateau band-stop, metal-faceting fix)' if self.args.geo_smooth else 'off'}")
+        self.log(f"  geo-smooth : {'ON (EXPERIMENTAL plateau band-stop)' if self.args.geo_smooth else 'off'}")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)
