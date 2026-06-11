@@ -789,6 +789,12 @@ class Daemon:
         probe_dir = slug_root / "probe"
         probe_dir.mkdir(parents=True, exist_ok=True)
 
+        # TripoSplat quick-splat companion — once per image regardless of how
+        # many tier/seed cells this probe runs (run_quick_splat self-skips if
+        # datasets/<slug>/quick_splat/ already has output from any prior run).
+        if self.args.quick_splat:
+            self.run_quick_splat(image_path, slug_root)
+
         self.log(f"  PROBE {image_path.name} → slug={slug}")
         image = Image.open(image_path)
         if self.args.force_rembg and image.mode == "RGBA":
