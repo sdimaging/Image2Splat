@@ -21,7 +21,7 @@ index 7129482..f28f02b 100644
          # Validate image_cond_models are set
          assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
 diff --git a/pixal3d/renderers/pbr_mesh_renderer.py b/pixal3d/renderers/pbr_mesh_renderer.py
-index 14ded30..0bd74ff 100644
+index 14ded30..ecbb48c 100644
 --- a/pixal3d/renderers/pbr_mesh_renderer.py
 +++ b/pixal3d/renderers/pbr_mesh_renderer.py
 @@ -1,4 +1,5 @@
@@ -114,6 +114,17 @@ index 14ded30..0bd74ff 100644
                  gb_normal = torch.where(
                      torch.sum(gb_normal * (pos - rays_o), dim=-1, keepdim=True) > 0,
                      -gb_normal,
+@@ -490,8 +550,9 @@ class PbrMeshRenderer:
+                 alpha += w
+         
+         # Ambient occulusion
++        _ssao_intensity = float(os.environ.get("PIXAL3D_SSAO_INTENSITY", "0.8"))
+         f_occ = screen_space_ambient_occlusion(
+-            depth, normal, perspective, intensity=1.5
++            depth, normal, perspective, intensity=_ssao_intensity
+         )
+         shaded *= (1 - f_occ)
+         out_dict.clay = (1 - f_occ)
 diff --git a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py b/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
 index a51e752..a45f4bd 100644
 --- a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py

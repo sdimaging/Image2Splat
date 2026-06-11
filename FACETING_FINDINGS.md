@@ -31,16 +31,31 @@ Seed-dependence: some shape-SLat samples decode smooth panels, most decode
    measured 1.80→1.76 ratio, 19.2°→15.5°. INSUFFICIENT at feasible
    iteration counts (diffusion radius too small vs plateau scale).
 
-## Candidate next steps (untested)
+## Fix 3: SSAO intensity 1.5 → 0.8 (SHIPPED 2026-06-11)
+One-line change to `pbr_mesh_renderer.py`; default now env-var overridable
+via `PIXAL3D_SSAO_INTENSITY` (default 0.8).
+
+**A/B measurement on same mesh, same view (Chest.png T5 seed222 view129):**
+
+| | clay_fg (higher = less AO darkening) |
+|---|---|
+| SSAO=1.5 (old) | 0.783 — 21.7% light blocked |
+| SSAO=0.8 (new) | 0.883 — 11.7% light blocked |
+
+Result: **AO contribution cut in half.** The plateau contrast ratio is reduced
+proportionally. Geometry plateaus still exist; this is a partial fix.
+
+Patch updated: `patches/pixal3d_smooth_normals.patch` includes the SSAO change.
+A/B composite images: `/tmp/facet_diag_ab_chest/AB_comparison.png`
+
+## Remaining candidate steps
 1. **Geometry-space smoothing** post-decim: Taubin lambda-mu on vertices,
-   curvature-thresholded to protect flutes/edges. Also fixes the +15% AO term.
+   curvature-thresholded to protect flutes/edges. Attacks root cause directly.
 2. **SDF/voxel-grid smoothing** before mesh extraction (attacks root).
-3. **SSAO intensity reduction** (hardcoded 1.5 in pbr_mesh_renderer.py render();
-   ~0.8 would halve the AO contribution). One-line, cheap partial win.
-4. **Seed auto-selection**: score probe cells by plateau metric (large-scale
+3. **Seed auto-selection**: score probe cells by plateau metric (large-scale
    luminance std on metal masks) and auto-rank — automates the current
    manual 2-3-good-out-of-20 workflow.
-5. Longer term: SLat-PiD H100 training (see Desktop/Image2Splat_Research/).
+4. Longer term: SLat-PiD H100 training (see Desktop/Image2Splat_Research/).
 
 ## Tooling
 - `scripts/diagnose_facets.py` — renders ONE asset cell, dumps ALL renderer

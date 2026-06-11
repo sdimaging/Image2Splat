@@ -27,6 +27,7 @@ USAGE (needs the GPU — don't run while the daemon is mid-batch):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,10 @@ def main() -> int:
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--max-faces", type=int, default=16_000_000)
     p.add_argument("--out-dir", type=Path, default=Path("/tmp/facet_diag"))
+    p.add_argument("--ssao-compare", action="store_true",
+                   help="After normal render (PIXAL3D_SSAO_INTENSITY or 0.8 default), "
+                        "re-render the same mesh at SSAO=1.5 for direct A/B comparison. "
+                        "Saves old-ssao/ subdir alongside the main output.")
     args = p.parse_args()
 
     if not args.input_image.is_file():
@@ -123,26 +128,76 @@ def main() -> int:
         print(f"(envmap load failed, rendering without: {e})")
         kwargs = {}
 
-    result = render_utils.render_frames(
-        mesh, extrinsics, intrinsics,
-        {"resolution": args.resolution, "bg_color": (0.1, 0.1, 0.1)},
-        verbose=False, **kwargs,
-    )
+    def _render_and_save(out_dir: Path, ssao_override: float = None):
+        if ssao_override is not None:
+            os.environ["PIXAL3D_SSAO_INTENSITY"] = str(ssao_override)
+        result = render_utils.render_frames(
+            mesh, extrinsics, intrinsics,
+            {"resolution": args.resolution, "bg_color": (0.1, 0.1, 0.1)},
+            verbose=False, **kwargs,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for key, frames in result.items():
+            arr = frames[0]
+            Image.fromarray(arr).save(out_dir / f"{key}.png")
+            saved.append(key)
+        if ssao_override is not None:
+            del os.environ["PIXAL3D_SSAO_INTENSITY"]
+        return saved
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for key, frames in result.items():
-        arr = frames[0]
-        out = args.out_dir / f"{key}.png"
-        Image.fromarray(arr).save(out)
-        saved.append(key)
+    print("rendering all channels (new SSAO)...")
+    saved = _render_and_save(args.out_dir)
     print(f"\nsaved channels: {saved}")
     print(f"output dir: {args.out_dir}")
+
+    if args.ssao_compare:
+        print("\nrendering comparison at SSAO=1.5 (old default)...")
+        old_dir = args.out_dir / "old_ssao"
+        _render_and_save(old_dir, ssao_override=1.5)
+        print(f"old-SSAO output: {old_dir}")
+        # Side-by-side composite
+        _make_ssao_comparison(args.out_dir, old_dir, args.out_dir / "AB_comparison.png")
+
     print("\nLook for the polygonal patches in each channel:")
     print("  base_color / roughness → texture decode content (attr-smooth fixable)")
     print("  clay                   → SSAO over chorded geometry")
     print("  normal                 → shading normals (patch not active?)")
     return 0
+
+
+def _make_ssao_comparison(new_dir: Path, old_dir: Path, out_path: Path):
+    from PIL import ImageDraw
+    new_shaded = Image.open(new_dir / "shaded.png").convert("RGB")
+    old_shaded = Image.open(old_dir / "shaded.png").convert("RGB")
+    new_clay   = Image.open(new_dir / "clay.png").convert("L").convert("RGB")
+    old_clay   = Image.open(old_dir / "clay.png").convert("L").convert("RGB")
+
+    def label(img, text):
+        out = img.copy()
+        draw = ImageDraw.Draw(out)
+        draw.rectangle([0, 0, img.width, 44], fill=(0, 0, 0))
+        draw.text((6, 6), text, fill=(255, 255, 255))
+        return out
+
+    row1 = [label(old_shaded, "SHADED  SSAO=1.5 (OLD)"),
+            label(new_shaded, "SHADED  SSAO=0.8 (NEW)")]
+    row2 = [label(old_clay,   "CLAY  SSAO=1.5 (OLD)"),
+            label(new_clay,   "CLAY  SSAO=0.8 (NEW)")]
+
+    W, H = new_shaded.size
+    combined = Image.new("RGB", (W * 2, H * 2))
+    for i, im in enumerate(row1): combined.paste(im, (i * W, 0))
+    for i, im in enumerate(row2): combined.paste(im, (i * W, H))
+    combined.save(out_path)
+    print(f"A/B composite: {out_path}  ({combined.width}x{combined.height})")
+
+    # Numeric summary
+    mask = np.array(Image.open(new_dir / "mask.png").convert("L")).astype(float) / 255.0 > 0.5
+    for tag, clay_path in [("SSAO=1.5", old_dir / "clay.png"),
+                             ("SSAO=0.8", new_dir / "clay.png")]:
+        clay = np.array(Image.open(clay_path).convert("L")).astype(float) / 255.0
+        print(f"  {tag}: clay_fg={clay[mask].mean():.3f}  (higher=less AO darkening)")
 
 
 if __name__ == "__main__":
