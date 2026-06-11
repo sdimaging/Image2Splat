@@ -35,6 +35,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+# Normally set inside the backbone init; needed on the --mesh-cache fast
+# path too (HDRI EXR loading via OpenCV).
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
 import numpy as np
 from PIL import Image
 
@@ -66,6 +70,17 @@ def main() -> int:
                    help="After normal render (PIXAL3D_SSAO_INTENSITY or 0.8 default), "
                         "re-render the same mesh at SSAO=1.5 for direct A/B comparison. "
                         "Saves old-ssao/ subdir alongside the main output.")
+    p.add_argument("--geo-compare", action="store_true",
+                   help="Render the mesh as-is, then apply plateau_band_stop geometry "
+                        "smoothing (mesh_smooth.py) and re-render — direct A/B of the "
+                        "geometry fix on one inference run. Saves geo_smooth/ subdir + "
+                        "GEO_AB_comparison.png composite + plateau metrics.")
+    p.add_argument("--geo-alpha", type=float, default=1.0)
+    p.add_argument("--geo-passes", type=int, default=1)
+    p.add_argument("--mesh-cache", type=Path, default=None,
+                   help="torch.save/load the generated mesh here. If the file "
+                        "exists, inference is SKIPPED (render-only iteration "
+                        "~30s instead of ~9min). Delete the file to regenerate.")
     args = p.parse_args()
 
     if not args.input_image.is_file():
@@ -75,43 +90,55 @@ def main() -> int:
     name, steps, shape_g, tex_g = SAMPLER_TIERS[args.tier]
     print(f"tier {args.tier} ({name})  steps={steps} shape={shape_g} tex={tex_g}  seed={args.seed}")
 
-    t0 = time.time()
-    print("loading backbone...")
-    bb = Backbone(
-        name="pixal3d",
-        pixal3d_pipeline_type="1536_cascade",
-        max_num_tokens=131072,
-        sparse_structure_sampler_params={"steps": steps, "guidance_strength": float(shape_g)},
-        shape_slat_sampler_params={"steps": steps, "guidance_strength": float(shape_g)},
-        tex_slat_sampler_params={"steps": steps, "guidance_strength": float(tex_g)},
-    ).load()
-    print(f"backbone loaded ({time.time()-t0:.0f}s)")
+    import torch
+    device = "cuda"
+    if args.mesh_cache and args.mesh_cache.exists():
+        print(f"loading cached mesh from {args.mesh_cache} (skipping inference)...")
+        repo_dir = Path.home() / "projects/Pixal3D"
+        sys.path.insert(0, str(repo_dir))   # MeshWithVoxel class for unpickle
+        mesh = torch.load(args.mesh_cache, map_location=device, weights_only=False)
+        print(f"mesh: {mesh.vertices.shape[0]:,}v / {mesh.faces.shape[0]:,}f (cached)")
+    else:
+        t0 = time.time()
+        print("loading backbone...")
+        bb = Backbone(
+            name="pixal3d",
+            pixal3d_pipeline_type="1536_cascade",
+            max_num_tokens=131072,
+            sparse_structure_sampler_params={"steps": steps, "guidance_strength": float(shape_g)},
+            shape_slat_sampler_params={"steps": steps, "guidance_strength": float(shape_g)},
+            tex_slat_sampler_params={"steps": steps, "guidance_strength": float(tex_g)},
+        ).load()
+        print(f"backbone loaded ({time.time()-t0:.0f}s)")
 
-    image = Image.open(args.input_image)
-    print("running inference...")
-    t1 = time.time()
-    mesh = bb.run(image, seed=args.seed)
-    n_faces = int(mesh.faces.shape[0])
-    print(f"mesh: {mesh.vertices.shape[0]:,}v / {n_faces:,}f  ({time.time()-t1:.0f}s)")
-    if n_faces > args.max_faces:
-        mesh.simplify(target=args.max_faces, verbose=False)
-        print(f"decimated: {mesh.vertices.shape[0]:,}v / {mesh.faces.shape[0]:,}f")
+        image = Image.open(args.input_image)
+        print("running inference...")
+        t1 = time.time()
+        mesh = bb.run(image, seed=args.seed)
+        n_faces = int(mesh.faces.shape[0])
+        print(f"mesh: {mesh.vertices.shape[0]:,}v / {n_faces:,}f  ({time.time()-t1:.0f}s)")
+        if n_faces > args.max_faces:
+            mesh.simplify(target=args.max_faces, verbose=False)
+            print(f"decimated: {mesh.vertices.shape[0]:,}v / {mesh.faces.shape[0]:,}f")
+        repo_dir = bb.repo_dir
+        if args.mesh_cache:
+            torch.save(mesh, args.mesh_cache)
+            print(f"mesh cached to {args.mesh_cache}")
 
     # Camera: same Fibonacci rig as the daemon, single view
-    import torch
     up = np.array([0, 0, 1.0])
     w2c = generate_camera_trajectory(200, radius=2.0, up=up)[args.view:args.view + 1]
 
     # Render via the pixal3d renderer directly so we get ALL channels
-    sys.path.insert(0, str(bb.repo_dir))
+    sys.path.insert(0, str(repo_dir))
     from pixal3d.utils import render_utils  # type: ignore
 
-    extrinsics = [torch.tensor(m, dtype=torch.float32, device=bb.device) for m in w2c]
+    extrinsics = [torch.tensor(m, dtype=torch.float32, device=device) for m in w2c]
     # normalized intrinsics for fov=40 (matches daemon default pre-adaptive)
     fov_rad = float(np.radians(40.0))
     focal = 0.5 / np.tan(fov_rad / 2.0)
     intr = torch.tensor([[focal, 0, 0.5], [0, focal, 0.5], [0, 0, 1]],
-                        dtype=torch.float32, device=bb.device)
+                        dtype=torch.float32, device=device)
     intrinsics = [intr]
 
     print("rendering all channels...")
@@ -122,7 +149,7 @@ def main() -> int:
         from pixal3d.renderers import EnvMap  # type: ignore
         hdri = Path.home() / "projects/TRELLIS.2/assets/hdri/USER_Alt2.exr"
         env_img = read_exr_rgb(hdri) * 2.5
-        envmap = EnvMap(torch.tensor(env_img, dtype=torch.float32, device=bb.device))
+        envmap = EnvMap(torch.tensor(env_img, dtype=torch.float32, device=device))
         kwargs = {"envmap": envmap}
     except Exception as e:
         print(f"(envmap load failed, rendering without: {e})")
@@ -159,11 +186,77 @@ def main() -> int:
         # Side-by-side composite
         _make_ssao_comparison(args.out_dir, old_dir, args.out_dir / "AB_comparison.png")
 
+    if args.geo_compare:
+        from mesh_smooth import plateau_band_stop
+        print(f"\napplying plateau_band_stop (alpha={args.geo_alpha}, "
+              f"passes={args.geo_passes})...")
+        t2 = time.time()
+        orig_verts = mesh.vertices.clone()
+        new_verts, gstats = plateau_band_stop(
+            mesh.vertices, mesh.faces,
+            alpha=args.geo_alpha, passes=args.geo_passes)
+        try:
+            mesh.vertices = new_verts
+        except (AttributeError, TypeError):
+            mesh.vertices.copy_(new_verts)
+        # Anchor voxel-attr texture sampling to the pre-displacement
+        # surface (renderer reads mesh.attr_vertices if present).
+        mesh.attr_vertices = orig_verts
+        print(f"smoothed in {time.time()-t2:.1f}s  stats: {gstats}")
+        geo_dir = args.out_dir / "geo_smooth"
+        _render_and_save(geo_dir)
+        print(f"geo-smoothed output: {geo_dir}")
+        _make_geo_comparison(args.out_dir, geo_dir,
+                             args.out_dir / "GEO_AB_comparison.png")
+
     print("\nLook for the polygonal patches in each channel:")
     print("  base_color / roughness → texture decode content (attr-smooth fixable)")
     print("  clay                   → SSAO over chorded geometry")
     print("  normal                 → shading normals (patch not active?)")
     return 0
+
+
+def _plateau_metrics(d: Path) -> dict:
+    """Bright/dark plateau contrast on the foreground of a channel dump."""
+    shaded = np.array(Image.open(d / "shaded.png").convert("RGB")).astype(float) / 255.0
+    mask = np.array(Image.open(d / "mask.png").convert("L")).astype(float) / 255.0 > 0.5
+    lum = 0.2126 * shaded[..., 0] + 0.7152 * shaded[..., 1] + 0.0722 * shaded[..., 2]
+    fg = lum[mask]
+    return {
+        "p90": float(np.percentile(fg, 90)),
+        "p10": float(np.percentile(fg, 10)),
+        "ratio": float(np.percentile(fg, 90) / (np.percentile(fg, 10) + 1e-6)),
+        "std": float(fg.std()),
+    }
+
+
+def _make_geo_comparison(orig_dir: Path, geo_dir: Path, out_path: Path):
+    from PIL import ImageDraw
+    o_shaded = Image.open(orig_dir / "shaded.png").convert("RGB")
+    g_shaded = Image.open(geo_dir / "shaded.png").convert("RGB")
+    o_norm = Image.open(orig_dir / "normal.png").convert("RGB")
+    g_norm = Image.open(geo_dir / "normal.png").convert("RGB")
+
+    def label(img, text):
+        out = img.copy()
+        draw = ImageDraw.Draw(out)
+        draw.rectangle([0, 0, img.width, 44], fill=(0, 0, 0))
+        draw.text((6, 6), text, fill=(255, 255, 255))
+        return out
+
+    W, H = o_shaded.size
+    combined = Image.new("RGB", (W * 2, H * 2))
+    combined.paste(label(o_shaded, "SHADED  original geometry"), (0, 0))
+    combined.paste(label(g_shaded, "SHADED  plateau band-stop"), (W, 0))
+    combined.paste(label(o_norm, "NORMAL  original geometry"), (0, H))
+    combined.paste(label(g_norm, "NORMAL  plateau band-stop"), (W, H))
+    combined.save(out_path)
+    print(f"GEO A/B composite: {out_path}  ({combined.width}x{combined.height})")
+
+    m_o = _plateau_metrics(orig_dir)
+    m_g = _plateau_metrics(geo_dir)
+    print(f"  original: lum p90/p10 ratio={m_o['ratio']:.2f}  std={m_o['std']:.3f}")
+    print(f"  smoothed: lum p90/p10 ratio={m_g['ratio']:.2f}  std={m_g['std']:.3f}")
 
 
 def _make_ssao_comparison(new_dir: Path, old_dir: Path, out_path: Path):

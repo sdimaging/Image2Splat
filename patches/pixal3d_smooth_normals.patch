@@ -21,7 +21,7 @@ index 7129482..f28f02b 100644
          # Validate image_cond_models are set
          assert self.image_cond_model_ss is not None, "image_cond_model_ss not set."
 diff --git a/pixal3d/renderers/pbr_mesh_renderer.py b/pixal3d/renderers/pbr_mesh_renderer.py
-index 14ded30..ecbb48c 100644
+index 14ded30..4957b40 100644
 --- a/pixal3d/renderers/pbr_mesh_renderer.py
 +++ b/pixal3d/renderers/pbr_mesh_renderer.py
 @@ -1,4 +1,5 @@
@@ -73,7 +73,24 @@ index 14ded30..ecbb48c 100644
  def cube_to_dir(s, x, y):
      if s == 0:   rx, ry, rz = torch.ones_like(x), -x, -y
      elif s == 1: rx, ry, rz = -torch.ones_like(x), x, -y
-@@ -319,6 +356,27 @@ class PbrMeshRenderer:
+@@ -304,7 +341,15 @@ class PbrMeshRenderer:
+         extrinsics = extrinsics.unsqueeze(0)
+         
+         vertices = mesh.vertices.unsqueeze(0)
+-        vertices_orig = vertices.clone()
++        # Voxel-attr texture lookup positions. The sparse attr shell only
++        # exists within ~1-2 voxels of the DECODED surface — if the render
++        # vertices were displaced afterwards (plateau geometry smoothing),
++        # sampling at the displaced positions reads empty space (black).
++        # A mesh may carry `attr_vertices` (pre-displacement positions) to
++        # anchor texture sampling to the original surface.
++        _attr_v = getattr(mesh, 'attr_vertices', None)
++        vertices_orig = (_attr_v.unsqueeze(0).clone() if _attr_v is not None
++                         else vertices.clone())
+         vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)
+         if transformation is not None:
+             vertices_homo = torch.bmm(vertices_homo, transformation.unsqueeze(0).transpose(-1, -2))
+@@ -319,6 +364,27 @@ class PbrMeshRenderer:
          e0 = v1 - v0
          e1 = v2 - v0
          face_normal = torch.cross(e0, e1, dim=1)
@@ -101,7 +118,7 @@ index 14ded30..ecbb48c 100644
          face_normal = F.normalize(face_normal, dim=1)
          
          out_dict = edict()
-@@ -337,8 +395,10 @@ class PbrMeshRenderer:
+@@ -337,8 +403,10 @@ class PbrMeshRenderer:
                  # Depth
                  gb_depth = dr.interpolate(vertices_camera[..., 2:3].contiguous(), rast, faces)[0][0]
                          
@@ -114,7 +131,7 @@ index 14ded30..ecbb48c 100644
                  gb_normal = torch.where(
                      torch.sum(gb_normal * (pos - rays_o), dim=-1, keepdim=True) > 0,
                      -gb_normal,
-@@ -490,8 +550,9 @@ class PbrMeshRenderer:
+@@ -490,8 +558,9 @@ class PbrMeshRenderer:
                  alpha += w
          
          # Ambient occulusion

@@ -498,6 +498,17 @@ def parse_args() -> argparse.Namespace:
                    help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
                         "the auto-FOV can go; if your default --fov is higher than "
                         "this, --no-adaptive-fov uses --fov as-is.")
+    # --- Plateau geometry smoothing (metal-faceting fix) ---
+    p.add_argument("--geo-smooth", action=argparse.BooleanOptionalAction, default=True,
+                   help="Surface-aware plateau band-stop on the generated mesh "
+                        "(mesh_smooth.plateau_smooth, runs post-decimation, <2s). "
+                        "Removes the 5-15%%-wavelength geometric undulation that "
+                        "reads as polygonal facets on glossy metal, while a "
+                        "0.5%%-of-bbox amplitude gate preserves real features "
+                        "(teeth, straps, engraving). Pass --no-geo-smooth to "
+                        "render the raw decode.")
+    p.add_argument("--geo-smooth-alpha", type=float, default=1.0,
+                   help="Fraction of the isolated plateau band to remove (0-1).")
     # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
     p.add_argument("--batch-tiered", type=Path, default=None,
                    help="BATCH MODE: parent directory containing T<N>_<seed>/ "
@@ -635,6 +646,37 @@ class Daemon:
                  f"(margin {self.args.adaptive_fov_margin:.2f})")
         return float(fov), new_intr
 
+    def _maybe_geo_smooth(self, mesh) -> None:
+        """Apply the plateau band-stop to the mesh in place (if enabled).
+
+        Removes the 5-15%-wavelength geometric undulation (the metal-faceting
+        root cause) via mesh_smooth.plateau_smooth. Surface-aware (cluster
+        graph from mesh connectivity), amplitude-gated at 0.5% of bbox so
+        real features survive. Non-fatal: any failure logs and continues
+        with the raw mesh.
+        """
+        if not getattr(self.args, "geo_smooth", False):
+            return
+        try:
+            from mesh_smooth import plateau_smooth
+            t0 = time.time()
+            orig_verts = mesh.vertices.clone()
+            new_verts, gstats = plateau_smooth(
+                mesh.vertices, mesh.faces, alpha=self.args.geo_smooth_alpha)
+            try:
+                mesh.vertices = new_verts
+            except (AttributeError, TypeError):
+                mesh.vertices.copy_(new_verts)
+            # Anchor voxel-attr texture sampling to the pre-displacement
+            # surface (patched pbr_mesh_renderer reads mesh.attr_vertices).
+            mesh.attr_vertices = orig_verts
+            self.log(f"  geo-smooth: plateau band-stop in {time.time()-t0:.1f}s "
+                     f"(mean disp {gstats['mean_disp']:.4f}, "
+                     f"p95 {gstats['p95_disp']:.4f}, "
+                     f"{gstats['clusters']:,} clusters)")
+        except Exception as e:  # noqa: BLE001 — never kill a run over polish
+            self.log(f"  geo-smooth WARN: failed ({e}) — continuing with raw mesh")
+
     def run_quick_splat(self, image_path: Path, slug_root: Path) -> None:
         """Produce a TripoSplat quick-splat preview as an isolated subprocess.
 
@@ -713,6 +755,7 @@ class Daemon:
             mesh.simplify(target=self.args.max_faces, verbose=False)
             self.log(f"  simplified: {mesh.vertices.shape[0]:,} verts, "
                      f"{mesh.faces.shape[0]:,} faces")
+        self._maybe_geo_smooth(mesh)
 
         # --- Mesh export (mode in {mesh, both}) ---
         if mode in ("mesh", "both"):
@@ -848,6 +891,7 @@ class Daemon:
                                  f"→ DECIM → {post_verts:,}v / {post_faces:,}f")
                     else:
                         self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
+                    self._maybe_geo_smooth(mesh)
 
                     # Adaptive FOV for the probe view (per-cell — mesh changes per tier/seed).
                     if not self.args.adaptive_fov:
@@ -1226,6 +1270,7 @@ class Daemon:
         else:
             self.log(f"  adapt-FOV : OFF — fixed {self.args.fov}°")
         self.log(f"  quick-splat: {'ON (TripoSplat preview per asset)' if self.args.quick_splat else 'off'}")
+        self.log(f"  geo-smooth : {'ON (plateau band-stop, metal-faceting fix)' if self.args.geo_smooth else 'off'}")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)

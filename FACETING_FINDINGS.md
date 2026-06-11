@@ -48,13 +48,50 @@ proportionally. Geometry plateaus still exist; this is a partial fix.
 Patch updated: `patches/pixal3d_smooth_normals.patch` includes the SSAO change.
 A/B composite images: `/tmp/facet_diag_ab_chest/AB_comparison.png`
 
+## Fix 4: plateau geometry band-stop (SHIPPED 2026-06-11) — the root-cause fix
+`scripts/mesh_smooth.py::plateau_smooth` — surface-aware removal of the
+plateau-band undulation from the mesh itself, post-decimation, <1s on 7.5M
+verts. Wired into the daemon as `--geo-smooth` (default ON) in BOTH the
+production and probe paths; banner line shows state.
+
+Architecture (8 iterations of design — failed approaches documented in the
+module docstring so nobody retries them):
+1. Vertex clustering (1.6% grid cells + 6-way normal bin) -> centroids.
+2. Cluster GRAPH from mesh edges (surface connectivity — stacked surfaces
+   never mix; verified zero displacement on parallel planes 5% apart).
+3. Implicit low-pass `(I+tL)^2 x = c` via conjugate gradient (reaches
+   plateau wavelengths in one solve) + band self-cleanup (squares the
+   large-scale leak).
+4. Triplanar-blended trilinear interpolation of the band back to vertices
+   (kills cluster-border steps AND bin-seam silhouette notching).
+5. Safety stack: soft amplitude gate (0.5% bbox tanh), normal-coherence
+   gate min-capped by own cluster (suppresses rims/teeth/detail), open-
+   boundary freeze with faded dilation, and a LOCAL SHELL-THICKNESS cap
+   (35% of own-to-opposite-bin distance — prevents thin-shell z-fighting).
+
+Verified on three assets (Mimic chest, ornate knight piece, fluted
+breastplate): plateau patches visibly softened in shaded + normal channels,
+silhouettes clean, teeth/straps/flutes/engraving intact, no texture loss.
+Breastplate metrics: lum p90/p10 2.06 -> 1.91, std 0.107 -> 0.098.
+Evidence: docs/faceting_ab/. The correction is conservative by design
+(thickness cap binds on thin shells) — partial fix, never harmful.
+
+Companion renderer change: `attr_vertices` texture anchor in
+pbr_mesh_renderer.py (voxel attrs sampled at PRE-displacement positions —
+without it, moved verts read outside the sparse attr shell = black).
+In patches/pixal3d_smooth_normals.patch.
+
+Tooling: `diagnose_facets.py --geo-compare` (A/B on one inference) and
+`--mesh-cache` (torch.save the mesh; render-only iteration ~40s vs ~9min).
+
 ## Remaining candidate steps
-1. **Geometry-space smoothing** post-decim: Taubin lambda-mu on vertices,
-   curvature-thresholded to protect flutes/edges. Attacks root cause directly.
-2. **SDF/voxel-grid smoothing** before mesh extraction (attacks root).
-3. **Seed auto-selection**: score probe cells by plateau metric (large-scale
+1. **SDF/voxel-grid smoothing** before mesh extraction (attacks root even
+   earlier; needs TRELLIS decode internals).
+2. **Seed auto-selection**: score probe cells by plateau metric (large-scale
    luminance std on metal masks) and auto-rank — automates the current
    manual 2-3-good-out-of-20 workflow.
+3. Raise the shell-thickness budget (0.35 -> ~0.45) if z-fighting stays
+   absent in production; recovers correction strength on thin armor.
 4. Longer term: SLat-PiD H100 training (see Desktop/Image2Splat_Research/).
 
 ## Tooling
