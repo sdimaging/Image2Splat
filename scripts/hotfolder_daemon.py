@@ -498,18 +498,20 @@ def parse_args() -> argparse.Namespace:
                    help="Upper clamp for adaptive FOV (deg). Ceiling caps how loose "
                         "the auto-FOV can go; if your default --fov is higher than "
                         "this, --no-adaptive-fov uses --fov as-is.")
-    # --- Plateau geometry smoothing (EXPERIMENTAL — metal-faceting fix) ---
-    p.add_argument("--geo-smooth", action=argparse.BooleanOptionalAction, default=False,
-                   help="EXPERIMENTAL: surface-aware plateau band-stop on the "
-                        "generated mesh (mesh_smooth.plateau_smooth, post-"
-                        "decimation, <2s). Softens the 5-15%%-wavelength "
-                        "geometric plateaus that read as facets on glossy "
-                        "metal, BUT currently adds ~40%% high-frequency "
-                        "normal-field noise concentrated at feature edges — "
-                        "not production quality (2026-06-11, see "
-                        "FACETING_FINDINGS.md). Default OFF.")
-    p.add_argument("--geo-smooth-alpha", type=float, default=1.0,
-                   help="Fraction of the isolated plateau band to remove (0-1).")
+    # NOTE: geometry plateau smoothing was REMOVED from the daemon
+    # (2026-06-11, Spenser's call): it traded plateau facets for
+    # high-frequency feature-edge noise. Seed selection is the production
+    # answer — see scripts/rank_seeds.py and FACETING_FINDINGS.md.
+    # The experiment survives offline in mesh_smooth.py +
+    # diagnose_facets.py --geo-compare.
+    p.add_argument("--seed-sweep", type=int, default=0, metavar="N",
+                   help="SEED SWEEP: render PROBE_VIEW for N seeds (anchor "
+                        "--seed + N-1 randoms) at ONE tier (--tier 1-5, "
+                        "default production tier). Cells land in "
+                        "datasets/<slug>/probe/ in the standard naming, then "
+                        "rank_seeds.py auto-ranks them (seed_ranking.md). "
+                        "~60-65s per seed. Skips already-rendered cells, so "
+                        "re-running with a bigger N resumes.")
     # --- Batch mode: walk pre-organized T<N>_<seed>/ folders, one tier per folder ---
     p.add_argument("--batch-tiered", type=Path, default=None,
                    help="BATCH MODE: parent directory containing T<N>_<seed>/ "
@@ -647,37 +649,6 @@ class Daemon:
                  f"(margin {self.args.adaptive_fov_margin:.2f})")
         return float(fov), new_intr
 
-    def _maybe_geo_smooth(self, mesh) -> None:
-        """Apply the plateau band-stop to the mesh in place (if enabled).
-
-        Removes the 5-15%-wavelength geometric undulation (the metal-faceting
-        root cause) via mesh_smooth.plateau_smooth. Surface-aware (cluster
-        graph from mesh connectivity), amplitude-gated at 0.5% of bbox so
-        real features survive. Non-fatal: any failure logs and continues
-        with the raw mesh.
-        """
-        if not getattr(self.args, "geo_smooth", False):
-            return
-        try:
-            from mesh_smooth import plateau_smooth
-            t0 = time.time()
-            orig_verts = mesh.vertices.clone()
-            new_verts, gstats = plateau_smooth(
-                mesh.vertices, mesh.faces, alpha=self.args.geo_smooth_alpha)
-            try:
-                mesh.vertices = new_verts
-            except (AttributeError, TypeError):
-                mesh.vertices.copy_(new_verts)
-            # Anchor voxel-attr texture sampling to the pre-displacement
-            # surface (patched pbr_mesh_renderer reads mesh.attr_vertices).
-            mesh.attr_vertices = orig_verts
-            self.log(f"  geo-smooth: plateau band-stop in {time.time()-t0:.1f}s "
-                     f"(mean disp {gstats['mean_disp']:.4f}, "
-                     f"p95 {gstats['p95_disp']:.4f}, "
-                     f"{gstats['clusters']:,} clusters)")
-        except Exception as e:  # noqa: BLE001 — never kill a run over polish
-            self.log(f"  geo-smooth WARN: failed ({e}) — continuing with raw mesh")
-
     def run_quick_splat(self, image_path: Path, slug_root: Path) -> None:
         """Produce a TripoSplat quick-splat preview as an isolated subprocess.
 
@@ -756,7 +727,6 @@ class Daemon:
             mesh.simplify(target=self.args.max_faces, verbose=False)
             self.log(f"  simplified: {mesh.vertices.shape[0]:,} verts, "
                      f"{mesh.faces.shape[0]:,} faces")
-        self._maybe_geo_smooth(mesh)
 
         # --- Mesh export (mode in {mesh, both}) ---
         if mode in ("mesh", "both"):
@@ -846,7 +816,12 @@ class Daemon:
             self.log(f"  force-rembg: stripped alpha, BiRefNet will run")
 
         view_w2c = w2c[PROBE_VIEW:PROBE_VIEW + 1]
-        n_total = len(SAMPLER_TIERS) * len(self.probe_seeds)
+        # Seed sweep = one tier x many seeds; classic probe = all 5 tiers.
+        if self.args.seed_sweep > 0:
+            tier_items = [(self.args.tier, SAMPLER_TIERS[self.args.tier])]
+        else:
+            tier_items = list(SAMPLER_TIERS.items())
+        n_total = len(tier_items) * len(self.probe_seeds)
         run_idx = 0
 
         # Per-cell production data accumulated here
@@ -858,7 +833,7 @@ class Daemon:
         input_w, input_h = image.size
         input_mode = image.mode
 
-        for tier_key, (tier_name, _, _, _) in SAMPLER_TIERS.items():
+        for tier_key, (tier_name, _, _, _) in tier_items:
             _apply_tier_to_backbone(bb, tier_key)
             eff_sparse = dict(bb.sparse_structure_sampler_params)
             eff_shape = dict(bb.shape_slat_sampler_params)
@@ -892,8 +867,7 @@ class Daemon:
                                  f"→ DECIM → {post_verts:,}v / {post_faces:,}f")
                     else:
                         self.log(f"    mesh: {raw_verts:,}v / {raw_faces:,}f (under {self.args.max_faces:,} cap, no decim)")
-                    self._maybe_geo_smooth(mesh)
-
+            
                     # Adaptive FOV for the probe view (per-cell — mesh changes per tier/seed).
                     if not self.args.adaptive_fov:
                         cell_fov = float(self.args.fov)
@@ -1043,6 +1017,20 @@ class Daemon:
             (probe_dir / "probe_summary.md").write_text(_build_probe_summary_md(meta))
         except OSError:
             pass
+
+        # Auto-rank the cells by plateau-faceting score (seed selection).
+        try:
+            from rank_seeds import rank_probe_dir
+            ranked = rank_probe_dir(probe_dir)
+            if ranked:
+                top = ranked[:3]
+                self.log("  seed ranking (lower = smoother, full table in "
+                         "probe/seed_ranking.md):")
+                for i, c in enumerate(top, 1):
+                    self.log(f"    {i}. T{c['tier']} seed={c['seed']}  "
+                             f"score={c['score']:.2f}")
+        except Exception as e:  # noqa: BLE001 — ranking is advisory
+            self.log(f"  seed-ranking WARN: {e}")
 
         if cuda_fatal:
             # Meta is written for diagnosis, but the asset must NOT be marked
@@ -1232,7 +1220,14 @@ class Daemon:
 
         # Build the probe seed list once if probe mode
         self.probe_seeds: list[int] = []
-        if self.args.tier == PROBE_TIER_KEY:
+        if self.args.seed_sweep > 0:
+            # Seed sweep: one tier × N seeds through the probe pipeline.
+            if self.args.tier == PROBE_TIER_KEY:
+                self.args.tier = "5"        # sweep needs a concrete tier
+            self.probe_seeds = build_probe_seed_list(
+                self.args.seed_sweep, anchor_seed=self.args.seed
+            )
+        elif self.args.tier == PROBE_TIER_KEY:
             self.probe_seeds = build_probe_seed_list(
                 self.args.probe_seed_count, anchor_seed=self.args.seed
             )
@@ -1256,6 +1251,13 @@ class Daemon:
             self.log(f"  batch     : {self.args.batch_tiered}")
             self.log(f"  order     : {self.args.batch_order}")
             self.log(f"  on-fail   : {self.args.batch_failure_policy}")
+        elif self.args.seed_sweep > 0:
+            t_name = SAMPLER_TIERS[self.args.tier][0]
+            self.log(f"  sampler   : SEED SWEEP — tier {self.args.tier} ({t_name}) "
+                     f"× {len(self.probe_seeds)} seeds at view {PROBE_VIEW} "
+                     f"(~{len(self.probe_seeds)} min/asset, auto-ranked)")
+            self.log(f"  seeds     : {self.probe_seeds[:10]}"
+                     f"{' ...' if len(self.probe_seeds) > 10 else ''}")
         elif self.args.tier == PROBE_TIER_KEY:
             self.log(f"  sampler   : PROBE mode — all 5 tiers at view {PROBE_VIEW}")
             self.log(f"  seeds     : {self.probe_seeds}")
@@ -1271,7 +1273,6 @@ class Daemon:
         else:
             self.log(f"  adapt-FOV : OFF — fixed {self.args.fov}°")
         self.log(f"  quick-splat: {'ON (TripoSplat preview per asset)' if self.args.quick_splat else 'off'}")
-        self.log(f"  geo-smooth : {'ON (EXPERIMENTAL plateau band-stop)' if self.args.geo_smooth else 'off'}")
         self.log("=" * 60)
 
         # Initial sampler params: apply tier 1-5 (probe mode mutates per-iteration)
@@ -1336,7 +1337,7 @@ class Daemon:
                 self.log(f"START {proc_path.name}")
                 t0 = time.time()
                 try:
-                    if self.args.tier == PROBE_TIER_KEY:
+                    if self.args.tier == PROBE_TIER_KEY or self.args.seed_sweep > 0:
                         self.process_one_probe(bb, envmap, w2c, proc_path)
                     else:
                         self.process_one(bb, envmap, w2c, intr, proc_path)
