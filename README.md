@@ -106,41 +106,61 @@ export IMAGE2SPLAT_HOTFOLDER='/mnt/c/Users/<you>/Desktop/image2splat'
 
 The daemon will auto-create `inbox/`, `processing/`, `completed/`, `failed/`, and `datasets/` subfolders inside this directory on first run.
 
-### Run the daemon
+### Run the daemon (resilient launcher)
 
 Either:
-- Double-click `Start Splat Daemon.bat` (Windows) — opens a terminal, prompts you for seed / HDRI / tier / etc.
-- Or: `bash scripts/run_hotfolder.sh` in WSL directly
+- Double-click `Start Splat Daemon.bat` (Windows) — opens a terminal and prompts for the run type.
+- Or: `bash scripts/run_hotfolder_watchdog.sh --ask` in WSL directly.
 
-You'll get this prompt sequence:
+You'll get a single prompt:
 ```
-Seed [default 222]:
-HDRI: <list of EXRs>
-Force background removal even on already-masked PNGs? [y/N]:
-Sampler tier:
+Run type:
   1) Default    steps=12 shape=7.5 tex=1.1
   2) Subtle     steps=13 shape=7.6 tex=1.2
   3) Balanced   steps=14 shape=7.7 tex=1.25
   4) Refined    steps=15 shape=7.6 tex=1.2
   5) Sculpted   steps=15 shape=8.0 tex=1.5
-  6) Probe      runs ALL 5 tiers at view 129 (multi-tier comparison)
-Select [1-6, default 1]:
+  6) Probe      all 5 tiers at view 129 (multi-tier comparison)
+  B) Batch      run pre-staged T#_seed#/ folders in inbox
+Select [1-6 / B, default 1]:
 ```
 
-Then drop images into `inbox/`. Daemon picks them up, processes, moves source to `completed/`, writes dataset to `datasets/`.
+Then drop images into `inbox/`. The daemon picks them up, processes, moves the source to
+`completed/`, and writes the dataset to `datasets/`.
+
+**The run self-heals** — this is the watchdog wrapper (`run_hotfolder_watchdog.sh`):
+- **Auto-restart** on OOM kills and GPU driver resets, resuming via skip-existing (finished
+  datasets are never redone).
+- **3-strike quarantine** — if one image crashes the daemon 3 times (e.g. a pathological asset
+  that explodes the mesh and trips the GPU), it's moved to `failed/` and the run continues on
+  the rest, instead of stopping the whole batch.
+- **Reboot-proof resume** — the chosen run config + strike counts are saved to
+  `.watchdog_state`; if the PC reboots or the window closes, just re-launch and it offers to
+  resume the exact run (or press `n` to start fresh).
+
+(The plain one-shot launcher `scripts/run_hotfolder.sh` is still available if you want the
+daemon without the watchdog.)
 
 ### Probe mode (option 6)
 
-Don't know which tier suits an asset? Drop it in, pick **6 — Probe**:
+Don't know which tier/seed suits an asset? Drop it in, pick **6 — Probe**:
 
 ```
-Probe seeds (1 = just 222, N = 222 + N-1 randoms):
-Select [1-8, default 1]:
+Probe seeds: enter a COUNT for random (e.g. 3), or an explicit
+comma-list to PIN exact seeds (e.g. 222,74964,91766).
+Seeds [default 3]:
 ```
 
-Daemon renders **view 129 only** at **5 tiers × N seeds** = 5N comparison frames at `datasets/<slug>/probe/`, plus `probe_meta.json` for reproducibility.
+- A **count** `N` → 222 anchor + N-1 random seeds (logged in `probe_meta.json` for reproducibility).
+- A **comma-list** → those exact seeds, identical for every asset. Pin a seed set that works well
+  for your content and reuse it across runs.
 
-Open the folder in Photoshop / Bridge as layers, flip between tiers + seeds, pick the winner. Then re-drop the same image at that specific tier for the full 200v render.
+The daemon renders **view 129 only** at **5 tiers × (seeds)** comparison frames at
+`datasets/<slug>/probe/`, plus `probe_meta.json`.
+
+Open the folder in Photoshop / Bridge as layers, flip between tiers + seeds, pick the winner.
+Then re-drop the same image at that specific tier for the full 200v render — or stage a
+`T#_seed#/` batch and run option **B**.
 
 ### Optional: AutoCrop before splat pipeline (recommended for catalog-style sources)
 
@@ -252,13 +272,17 @@ src/                     ← Python source for the splat pipeline
   export_nerfstudio.py     Nerfstudio transforms.json writer
 
 scripts/
-  hotfolder_daemon.py      The main daemon
-  run_hotfolder.sh         WSL launcher for the daemon
-  setup_env.sh             Install Pixal3D + TRELLIS.2 + conda env
-  autocrop.py              Pixel-stat bbox autocropper for tight-cropping
-  run_autocrop.sh          WSL wrapper for autocrop
-  probe_tier_validation.py Reproducer for the tier-locking sweep
-  fix_colmap_postshot11.py PostShot v1.1+ COLMAP track-count patcher
+  hotfolder_daemon.py        The main daemon
+  run_hotfolder_watchdog.sh  Resilient launcher: auto-restart, 3-strike
+                             quarantine, reboot-proof resume (recommended)
+  run_hotfolder.sh           Plain one-shot launcher (no watchdog)
+  rank_seeds.py              Score/rank probe cells by plateau-faceting metric
+  quick_splat.py             TripoSplat feed-forward preview splat per asset
+  setup_env.sh               Install Pixal3D + TRELLIS.2 + conda env
+  autocrop.py                Pixel-stat bbox autocropper for tight-cropping
+  run_autocrop.sh            WSL wrapper for autocrop
+  probe_tier_validation.py   Reproducer for the tier-locking sweep
+  fix_colmap_postshot11.py   PostShot v1.1+ COLMAP track-count patcher
 
 upscale/
   upres.py                 AuraSR folder-to-folder upscaler

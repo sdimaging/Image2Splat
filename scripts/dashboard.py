@@ -42,7 +42,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 VALID_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-DEFAULT_HOTFOLDER = Path("/mnt/c/Users/Spenser Dickerson/Desktop/image_to_splat")
+DEFAULT_HOTFOLDER = Path(
+    os.environ.get("IMAGE2SPLAT_HOTFOLDER", str(Path.home() / "image2splat"))
+).expanduser()
 DEFAULT_PORT = 8080
 LOG_TAIL_LINES = 40
 ETA_WINDOW = 5  # rolling average of last N completed assets

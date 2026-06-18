@@ -479,7 +479,12 @@ def parse_args() -> argparse.Namespace:
                         "= all 5 tiers at view {PROBE_VIEW}).")
     p.add_argument("--probe-seed-count", type=int, default=1,
                    help="In probe mode, number of seeds to test (1=just DEFAULT_SEED, "
-                        "N=anchor + N-1 randoms). Ignored when --tier != 6.")
+                        "N=anchor + N-1 randoms). Ignored when --tier != 6 or when "
+                        "--probe-seeds is given.")
+    p.add_argument("--probe-seeds", type=str, default="",
+                   help="In probe mode, EXPLICIT comma-separated seeds to test "
+                        "(e.g. '222,74964,91766'). Overrides --probe-seed-count's "
+                        "random generation — pins the exact seeds for every asset.")
     p.add_argument("--adaptive-fov", action=argparse.BooleanOptionalAction, default=True,
                    help="Per-asset adaptive FOV: tighten FOV to fit mesh silhouette "
                         "(worst-view-fits-all across all cameras). On by default — "
@@ -1018,19 +1023,10 @@ class Daemon:
         except OSError:
             pass
 
-        # Auto-rank the cells by plateau-faceting score (seed selection).
-        try:
-            from rank_seeds import rank_probe_dir
-            ranked = rank_probe_dir(probe_dir)
-            if ranked:
-                top = ranked[:3]
-                self.log("  seed ranking (lower = smoother, full table in "
-                         "probe/seed_ranking.md):")
-                for i, c in enumerate(top, 1):
-                    self.log(f"    {i}. T{c['tier']} seed={c['seed']}  "
-                             f"score={c['score']:.2f}")
-        except Exception as e:  # noqa: BLE001 — ranking is advisory
-            self.log(f"  seed-ranking WARN: {e}")
+        # NOTE: in-loop seed ranking REMOVED (2026-06-14) — band-pass blurs on
+        # twenty full-res probe PNGs added ~7-8 min PER image (an overnight
+        # killer), and the rankings weren't being used. Rank offline anytime
+        # with: python scripts/rank_seeds.py <hotfolder>/datasets --all
 
         if cuda_fatal:
             # Meta is written for diagnosis, but the asset must NOT be marked
@@ -1228,9 +1224,14 @@ class Daemon:
                 self.args.seed_sweep, anchor_seed=self.args.seed
             )
         elif self.args.tier == PROBE_TIER_KEY:
-            self.probe_seeds = build_probe_seed_list(
-                self.args.probe_seed_count, anchor_seed=self.args.seed
-            )
+            if self.args.probe_seeds.strip():
+                # Explicit pinned seeds — exact, same for every asset.
+                self.probe_seeds = [int(s) for s in self.args.probe_seeds.split(",")
+                                    if s.strip()]
+            else:
+                self.probe_seeds = build_probe_seed_list(
+                    self.args.probe_seed_count, anchor_seed=self.args.seed
+                )
 
         self.log("=" * 60)
         self.log("Hot-folder daemon starting")
