@@ -280,6 +280,7 @@ scripts/
                              quarantine, reboot-proof resume (recommended)
   run_hotfolder.sh           Plain one-shot launcher (no watchdog)
   rank_seeds.py              Score/rank probe cells by plateau-faceting metric
+  probepull.py               Stage probe selects -> inbox T#_seed#/ batch folders
   quick_splat.py             TripoSplat feed-forward preview splat per asset
   setup_env.sh               Install Pixal3D + TRELLIS.2 + conda env
   autocrop.py                Pixel-stat bbox autocropper for tight-cropping
