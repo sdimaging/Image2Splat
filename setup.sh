@@ -58,16 +58,18 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-log "Step 4/4: configure IMAGE2SPLAT_HOTFOLDER"
+log "Step 4/5: configure IMAGE2SPLAT_HOTFOLDER"
 # -----------------------------------------------------------------------------
 SHELL_RC="$HOME/.bashrc"
 [ -f "$HOME/.zshrc" ] && SHELL_RC="$HOME/.zshrc"
 
 if grep -q "IMAGE2SPLAT_HOTFOLDER" "$SHELL_RC" 2>/dev/null; then
-    ok "IMAGE2SPLAT_HOTFOLDER already set in $SHELL_RC"
+    HOTFOLDER=$(grep "export IMAGE2SPLAT_HOTFOLDER" "$SHELL_RC" | tail -1 \
+                | sed -E "s/.*=['\"]?([^'\"]*)['\"]?.*/\1/")
+    ok "IMAGE2SPLAT_HOTFOLDER already set: $HOTFOLDER"
 else
     DEFAULT_HOTFOLDER="$HOME/image2splat"
-    # If running in WSL, suggest a Desktop folder
+    # If running in WSL, suggest a Desktop folder (so the BATs are double-clickable)
     if grep -qi microsoft /proc/version; then
         WIN_USER=$(cmd.exe /c "echo %USERNAME%" 2>/dev/null | tr -d '\r')
         if [ -n "$WIN_USER" ]; then
@@ -75,24 +77,44 @@ else
         fi
     fi
     echo
+    echo "Pick where your hot-folder lives. On WSL choose a Windows path (e.g. a"
+    echo "Desktop folder) so the launcher BATs are double-clickable from Windows."
     read -p "Hot-folder location [default: $DEFAULT_HOTFOLDER]: " HOTFOLDER
     HOTFOLDER="${HOTFOLDER:-$DEFAULT_HOTFOLDER}"
     echo "" >> "$SHELL_RC"
     echo "# Image2Splat hot-folder" >> "$SHELL_RC"
     echo "export IMAGE2SPLAT_HOTFOLDER='$HOTFOLDER'" >> "$SHELL_RC"
-    mkdir -p "$HOTFOLDER"
     ok "IMAGE2SPLAT_HOTFOLDER added to $SHELL_RC"
-    ok "hotfolder created: $HOTFOLDER"
+fi
+
+# -----------------------------------------------------------------------------
+log "Step 5/5: create hot-folder tree + install launcher BATs"
+# -----------------------------------------------------------------------------
+mkdir -p "$HOTFOLDER"/{inbox,processing,completed,failed,datasets}
+mkdir -p "$HOTFOLDER/UPSCALE/Input" "$HOTFOLDER/UPSCALE/Output"
+ok "hot-folder tree ready: $HOTFOLDER"
+
+# Generate the BATs into the hot-folder with THIS repo's path baked in, so they
+# work no matter where the repo was cloned (no hardcoded ~/projects/Image2Splat).
+if [ -d "$REPO_DIR/bat" ]; then
+    for b in "$REPO_DIR"/bat/*.bat; do
+        name="$(basename "$b")"
+        dest="$HOTFOLDER/$name"
+        [ "$name" = "Start Upscale.bat" ] && dest="$HOTFOLDER/UPSCALE/$name"
+        sed "s#~/projects/Image2Splat#$REPO_DIR#g" "$b" > "$dest"
+    done
+    ok "launcher BATs installed into $HOTFOLDER (repo path: $REPO_DIR)"
+else
+    warn "no bat/ dir found in repo — skipped BAT install"
 fi
 
 echo
 log "Install complete."
 echo
 echo "Next steps:"
-echo "  1. Reload your shell:  source $SHELL_RC"
-echo "  2. (Windows-WSL) copy BAT files to Desktop:"
-echo "       cp '$REPO_DIR/bat/Start Splat Daemon.bat' /mnt/c/Users/<you>/Desktop/"
-echo "       cp '$REPO_DIR/bat/Start Upscale.bat' /mnt/c/Users/<you>/Desktop/UPSCALE/"
-echo "  3. Drop images into your hotfolder and run the daemon"
+echo "  1. Reload your shell:        source $SHELL_RC"
+echo "  2. Open your hot-folder:     $HOTFOLDER"
+echo "  3. Double-click 'Start Splat Daemon.bat' (or run the watchdog in WSL),"
+echo "     drop images into inbox\\, and pick a run type at the prompt."
 echo
 echo "  See README.md for full usage."

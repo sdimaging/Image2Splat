@@ -29,7 +29,12 @@ cd "$(dirname "$0")/.." || exit 1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OPENCV_IO_ENABLE_OPENEXR=1
 
+# Optional leading "--hotfolder PATH": the self-locating BAT passes the folder
+# it lives in, so the daemon, dashboard, and watchdog all agree on one root.
+# Falls back to $IMAGE2SPLAT_HOTFOLDER, then ~/image2splat.
 HF="${IMAGE2SPLAT_HOTFOLDER:-$HOME/image2splat}"
+if [ "${1:-}" = "--hotfolder" ]; then HF="$2"; shift 2; fi
+HF_ARG=(--hotfolder "$HF")
 PY="$HOME/miniconda3/envs/trellis2/bin/python"
 LOG="$HF/daemon.log"
 STATE="$HF/.watchdog_state"     # TAB-delimited: "RUNARGS\t<args...>" + "STRIKE\t<name>\t<n>"
@@ -130,9 +135,9 @@ attempt=0
 fastfail=0
 while [ "$stop" -eq 0 ]; do
     attempt=$((attempt + 1))
-    echo "[watchdog] $(date '+%F %T')  launch #$attempt  (--no-prompt ${RUNARGS[*]})"
+    echo "[watchdog] $(date '+%F %T')  launch #$attempt  (--no-prompt ${HF_ARG[*]} ${RUNARGS[*]})"
     start=$(date +%s)
-    "$PY" -u scripts/hotfolder_daemon.py --no-prompt "${RUNARGS[@]}"
+    "$PY" -u scripts/hotfolder_daemon.py --no-prompt "${HF_ARG[@]}" "${RUNARGS[@]}"
     code=$?
     ran=$(( $(date +%s) - start ))
     echo "[watchdog] $(date '+%F %T')  daemon exited code=$code (ran ${ran}s)"

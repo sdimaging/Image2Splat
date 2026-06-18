@@ -61,50 +61,53 @@ A note on PostShot v1.1+: it requires a track-count alignment that the daemon's 
 - **Disk:** ~50 GB for env + models + ~10 GB per processed asset (200 PNG renders × 3000×3000)
 - **Time per asset:** ~5-7 min mesh+render on 5090, ~10-15 min total once you include polish/colmap export.
 
-### Install
+### Install (turnkey)
 
 ```bash
-# 1. Clone this repo
-git clone https://github.com/sdimaging/Image2Splat.git
-cd Image2Splat
-
-# 2. Run the env setup (clones Pixal3D + TRELLIS.2, creates conda env)
-bash scripts/setup_env.sh
-
-# 3. (Windows-WSL) Copy the BAT files to your hot-folder on Desktop
-#    Recommended nested layout — everything in one folder for the splat workflow:
-#
-#    Desktop\image2splat\
-#      inbox\           ← drop source images here
-#      processing\      ← daemon work-in-flight
-#      completed\       ← successfully processed sources
-#      failed\          ← errors + .error.log
-#      datasets\        ← COLMAP/Nerfstudio output datasets
-#      UPSCALE\         ← (optional) AuraSR preprocessor folder
-#        Input\
-#        Output\
-#        Start Upscale.bat
-#      Start Splat Daemon.bat
-#      Autocrop.bat
-#
-cp bat/"Start Splat Daemon.bat" "$IMAGE2SPLAT_HOTFOLDER/"
-cp bat/"Autocrop.bat"           "$IMAGE2SPLAT_HOTFOLDER/"
-mkdir -p "$IMAGE2SPLAT_HOTFOLDER/UPSCALE"
-cp bat/"Start Upscale.bat"      "$IMAGE2SPLAT_HOTFOLDER/UPSCALE/"
+# In WSL — clone anywhere; the installer adapts to the location.
+git clone https://github.com/sdimaging/Image2Splat ~/projects/Image2Splat
+cd ~/projects/Image2Splat
+./setup.sh
 ```
 
-**Nesting UPSCALE inside the hot-folder is the recommended layout** — keeps the entire splat workflow toolset (autocrop → upscale → daemon) in one place. The UPSCALE BAT auto-detects its own location, so it can live anywhere on disk. If you want it as a standalone day-to-day image upscaler not tied to the splat workflow, you can put it wherever you like — `Desktop\UPSCALE\` works fine too.
+`setup.sh` does the whole thing (re-run safe):
+1. Clones TRELLIS.2 + Pixal3D and builds the `trellis2` + `anysplat` conda envs.
+2. Asks **where you want your hot-folder** and saves `IMAGE2SPLAT_HOTFOLDER`.
+3. **Creates the hot-folder tree** and **installs the launcher BATs into it**, with
+   this repo's path baked in — no manual copying, no hardcoded paths.
 
-### Configure
+The hot-folder ends up laid out like:
+```
+<your hot-folder>\
+  inbox\           ← drop source images here
+  processing\      ← daemon work-in-flight
+  completed\       ← successfully processed sources
+  failed\          ← errors + .error.log (3-strike quarantine lands here)
+  datasets\        ← COLMAP/Nerfstudio output datasets
+  UPSCALE\         ← AuraSR preprocessor (Input\ / Output\ / Start Upscale.bat)
+  Start Splat Daemon.bat
+  Start Dashboard.bat
+  Autocrop.bat
+```
 
-Set the hot-folder location (where dropped images get processed):
+> On WSL, pick a **Windows path** for the hot-folder (e.g. a Desktop folder) so the
+> `.bat` launchers are double-clickable from Windows.
+
+See [INSTALL.md](INSTALL.md) for prerequisites and the full step-by-step.
+
+### Configure (manual / advanced)
+
+The installer sets this for you; you only touch it to *move* the hot-folder:
 
 ```bash
 # In your ~/.bashrc or ~/.zshrc
 export IMAGE2SPLAT_HOTFOLDER='/mnt/c/Users/<you>/Desktop/image2splat'
 ```
 
-The daemon will auto-create `inbox/`, `processing/`, `completed/`, `failed/`, and `datasets/` subfolders inside this directory on first run.
+The daemon auto-creates `inbox/`, `processing/`, `completed/`, `failed/`, and
+`datasets/` inside this directory on first run, so a fresh path just works. The
+launcher BATs also self-locate — whatever folder a BAT sits in becomes the
+hot-folder it operates on, keeping the daemon and dashboard in agreement.
 
 ### Run the daemon (resilient launcher)
 
