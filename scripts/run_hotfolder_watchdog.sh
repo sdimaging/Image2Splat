@@ -9,9 +9,11 @@
 # HOW:
 #   - Relaunches the daemon and resumes via skip-existing (finished datasets
 #     are never redone).
-#   - PER-IMAGE 3-STRIKE QUARANTINE: each death strikes the in-flight image
-#     (last "START" in the log). Under 3 strikes -> back to inbox/, retried.
-#     At 3 -> moved to failed/ and bypassed; the run continues on the rest.
+#   - PER-IMAGE 3-STRIKE QUARANTINE: each death strikes the in-flight image,
+#     identified from THIS launch's new log lines (FAIL line first, then the
+#     batch/probe/single in-flight marker — works in every mode). Under 3
+#     strikes -> retried; at 3 -> moved to failed/ (found recursively, incl.
+#     T#_seed#/ batch folders) and bypassed; the run continues on the rest.
 #   - PERSISTENT STATE: the chosen run config + strike counts are written to
 #     $HF/.watchdog_state after every change. On startup the watchdog READS
 #     it, so even after a reboot it resumes the SAME run (no re-prompt) with
@@ -137,6 +139,7 @@ while [ "$stop" -eq 0 ]; do
     attempt=$((attempt + 1))
     echo "[watchdog] $(date '+%F %T')  launch #$attempt  (--no-prompt ${HF_ARG[*]} ${RUNARGS[*]})"
     start=$(date +%s)
+    loglines_before=$(wc -l < "$LOG" 2>/dev/null || echo 0)
     "$PY" -u scripts/hotfolder_daemon.py --no-prompt "${HF_ARG[@]}" "${RUNARGS[@]}"
     code=$?
     ran=$(( $(date +%s) - start ))
@@ -158,20 +161,27 @@ while [ "$stop" -eq 0 ]; do
     fi
 
     # --- per-image strike accounting (persisted) -------------------------
-    culprit=$(grep -E "\] START " "$LOG" 2>/dev/null | tail -1 \
-              | sed -E 's/^\[[^]]*\][[:space:]]*START[[:space:]]+//')
+    new=$(tail -n "+$((loglines_before + 1))" "$LOG" 2>/dev/null)
+    culprit=$(printf '%s\n' "$new" \
+              | grep -aE "FAIL [^:]+\.(png|jpg|jpeg|webp|bmp):" | tail -1 \
+              | sed -E 's/.*FAIL +(.+\.(png|jpg|jpeg|webp|bmp)):.*/\1/')
+    if [ -z "$culprit" ]; then
+        culprit=$(printf '%s\n' "$new" \
+                  | grep -aE "\][[:space:]]+(START|INFER|PROBE)[[:space:]]|\[[0-9]+\.[0-9]+/[0-9]+\][[:space:]]" | tail -1 \
+                  | sed -E 's/.*\[[0-9]+\.[0-9]+\/[0-9]+\][[:space:]]+//;
+                            s/.*\][[:space:]]*(START|INFER|PROBE)[[:space:]]+//;
+                            s/[[:space:]]*→[[:space:]]*slug=.*//')
+    fi
     if [ -n "$culprit" ]; then
         strikes["$culprit"]=$(( ${strikes["$culprit"]:-0} + 1 ))
         n=${strikes["$culprit"]}
+        cpath=$(find "$HF/inbox" "$HF/processing" -maxdepth 2 -type f -name "$culprit" 2>/dev/null | head -1)
         if [ "$n" -ge "$MAX_STRIKES" ]; then
-            for d in processing inbox; do
-                [ -f "$HF/$d/$culprit" ] && mv -f "$HF/$d/$culprit" "$HF/failed/" 2>/dev/null
-            done
+            [ -n "$cpath" ] && mv -f "$cpath" "$HF/failed/" 2>/dev/null
+            [ -f "$HF/processing/$culprit" ] && mv -f "$HF/processing/$culprit" "$HF/failed/" 2>/dev/null
             echo "[watchdog] '$culprit' failed ${n}x — QUARANTINED to failed/, bypassing."
         else
-            for d in failed processing; do
-                [ -f "$HF/$d/$culprit" ] && mv -f "$HF/$d/$culprit" "$HF/inbox/" 2>/dev/null
-            done
+            [ -f "$HF/failed/$culprit" ] && mv -f "$HF/failed/$culprit" "$HF/inbox/" 2>/dev/null
             echo "[watchdog] '$culprit' strike ${n}/${MAX_STRIKES} — will retry."
         fi
         state_save
